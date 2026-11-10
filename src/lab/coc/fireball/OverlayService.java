@@ -57,7 +57,9 @@ public final class OverlayService extends Service {
     }
 
     volatile Mode mode = Mode.IDLE; volatile Scene scene = new Scene(); volatile Xf xf; volatile boolean tracking = true;
-    private double scale = -1; private Map<String, Set<Long>> index; private Map<String, Integer> counts;
+    private double scale = -1, scanA; private Map<String, Set<Long>> index; private Map<String, Integer> counts;
+    private final Tracker tracker = new Tracker(); private volatile Tracker.Ref ref; private float[] scanGrey; private volatile long lastFix;
+    private Handler track; private HandlerThread trackT;
 
     private WindowManager wm; private OverlayView overlay; private WindowManager.LayoutParams overlayLp, bubbleLp;
     private LinearLayout bubble; private TextView status; private LinearLayout buttons;
@@ -79,6 +81,7 @@ public final class OverlayService extends Service {
         if (projection == null) { stopSelf(); return START_NOT_STICKY; }
         workT = new HandlerThread("fb-work"); workT.start(); work = new Handler(workT.getLooper());
         captureT = new HandlerThread("fb-capture"); captureT.start(); capture = new Handler(captureT.getLooper());
+        trackT = new HandlerThread("fb-track"); trackT.start(); track = new Handler(trackT.getLooper());
         projection.registerCallback(new MediaProjection.Callback() { @Override public void onStop() { ui.post(OverlayService.this::stopSelf); } }, ui);
         int[] wh = screenSize(); capW = wh[0]; capH = wh[1];
         reader = newReader(capW, capH);
@@ -117,6 +120,7 @@ public final class OverlayService extends Service {
         synchronized (lock) { if (held != null) held.close(); held = null; if (reader != null) reader.close(); }
         if (workT != null) workT.quitSafely();
         if (captureT != null) captureT.quitSafely();
+        if (trackT != null) trackT.quitSafely();
         super.onDestroy();
     }
 
@@ -154,11 +158,13 @@ public final class OverlayService extends Service {
         }
     }
 
-    /** Latest frame newer than `after` (ms), or null. */
-    private Bitmap grab(long after) {
+    /** Latest frame newer than `after` (ms), or null; `grey` (optional) gets the tracker's small grey copy of the same frame. */
+    private Bitmap grab(long after) { return grab(after, null); }
+    private Bitmap grab(long after, float[] grey) {
         synchronized (lock) {
             if (held == null || held.getTimestamp() / 1_000_000 < after) return null;
             lastTs = held.getTimestamp() / 1_000_000;
+            if (grey != null) greyOf(held, grey);
             Image.Plane p = held.getPlanes()[0]; ByteBuffer buf = p.getBuffer(); buf.rewind();
             int w = held.getWidth(), h = held.getHeight(), rowPx = p.getRowStride() / p.getPixelStride();
             Bitmap full = Bitmap.createBitmap(rowPx, h, Bitmap.Config.ARGB_8888); full.copyPixelsFromBuffer(buf);
@@ -167,10 +173,35 @@ public final class OverlayService extends Service {
         }
     }
 
-    private Bitmap waitFrame(long after, long timeoutMs) throws InterruptedException {
+    /** Small grey frame for the tracker (no bitmap copy): 2x2 samples per cell of the tracked screen band. Ts (ms) or -1. */
+    private long grey(long after, float[] out) {
+        synchronized (lock) {
+            if (held == null || held.getTimestamp() / 1_000_000 < after) return -1;
+            greyOf(held, out); return held.getTimestamp() / 1_000_000;
+        }
+    }
+    private static void greyOf(Image im, float[] out) {
+        Image.Plane p = im.getPlanes()[0]; ByteBuffer buf = p.getBuffer(); int rs = p.getRowStride(), ps = p.getPixelStride(), w = im.getWidth(), h = im.getHeight();
+        double x0 = Tracker.X0 * w, y0 = Tracker.Y0 * h, fx = (Tracker.X1 - Tracker.X0) * w / Tracker.W, fy = (Tracker.Y1 - Tracker.Y0) * h / Tracker.H;
+        int[] xs = new int[Tracker.W * 2];
+        for (int i = 0; i < Tracker.W; i++) { xs[2 * i] = (int) (x0 + (i + 0.25) * fx) * ps; xs[2 * i + 1] = (int) (x0 + (i + 0.75) * fx) * ps; }
+        for (int j = 0; j < Tracker.H; j++) {
+            int r0 = (int) (y0 + (j + 0.25) * fy) * rs, r1 = (int) (y0 + (j + 0.75) * fy) * rs;
+            for (int i = 0; i < Tracker.W; i++) {
+                int s = 0;
+                for (int q = 0; q < 4; q++) {
+                    int o = ((q & 1) == 0 ? r0 : r1) + xs[2 * i + (q >> 1)];
+                    s += 77 * (buf.get(o) & 255) + 150 * (buf.get(o + 1) & 255) + 29 * (buf.get(o + 2) & 255);
+                }
+                out[j * Tracker.W + i] = s / 1024f;
+            }
+        }
+    }
+
+    private Bitmap waitFrame(long after, long timeoutMs, float[] grey) throws InterruptedException {
         long end = System.currentTimeMillis() + timeoutMs;
-        while (System.currentTimeMillis() < end) { Bitmap b = grab(after); if (b != null) return b; Thread.sleep(40); }
-        return grab(0);
+        while (System.currentTimeMillis() < end) { Bitmap b = grab(after, grey); if (b != null) return b; Thread.sleep(40); }
+        return grab(0, grey);
     }
 
     // ---------------- scan / pick / plan ----------------
@@ -183,13 +214,14 @@ public final class OverlayService extends Service {
             String err = null; Scene sc = null; Xf x = null; long t0 = System.currentTimeMillis();
             try {
                 ensureSize();
-                Bitmap img = waitFrame(hidden + 120, 1500);
+                float[] g = new float[Tracker.N];
+                Bitmap img = waitFrame(hidden + 120, 1500, g); scanGrey = g;
                 ui.post(() -> { overlay.setVisibility(View.VISIBLE); bubble.setVisibility(View.VISIBLE); });
                 if (img == null) throw new Exception("нет кадра с экрана");
                 double[] used = new double[1];
                 List<Detector.Det> d = detector.detect(img, -1, used); img.recycle();
                 if (d.size() < 8) throw new Exception("почти ничего не найдено (" + d.size() + "). Открой базу целиком");
-                Detector.Lattice L = detector.fit(d); scale = used[0];
+                Detector.Lattice L = detector.fit(d); scale = used[0]; scanA = L.a;
                 sc = buildScene(d, L); x = new Xf(); x.a = L.a; x.b = L.b; x.cx = L.cx; x.cy = L.cy; x.capW = capW; x.capH = capH; x.time = System.currentTimeMillis();
                 buildIndex(sc);
             } catch (Throwable e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
@@ -197,7 +229,7 @@ public final class OverlayService extends Service {
             ui.post(() -> {
                 overlay.setVisibility(View.VISIBLE); bubble.setVisibility(View.VISIBLE);
                 if (fe != null) { mode = Mode.IDLE; setStatus("Ошибка: " + fe); refreshButtons(); return; }
-                scene = fs; xf = fx; mode = Mode.PICK; setPick(true);
+                scene = fs; xf = fx; ref = null; mode = Mode.PICK; setPick(true);
                 int nd = 0; for (Solver.Bld b : fs.B) if (b.def) nd++;
                 setStatus("Найдено защит: " + nd + " (" + ms + " мс). Тапни по цели"); refreshButtons(); overlay.invalidate();
             });
@@ -249,7 +281,7 @@ public final class OverlayService extends Service {
         final Solver.Bld T = best; mode = Mode.BUSY; setPick(false);
         setStatus("Цель: " + Solver.ru(T.name) + ". Считаю…"); refreshButtons();
         work.post(() -> {
-            Solver.Result r = new Solver(sc.B, T, prefs.getFloat("fbR", 6), prefs.getFloat("eqR", 4.7f), prefs.getBoolean("cleanup", false), prefs.getBoolean("outside", false)).solve();
+            Solver.Result r = new Solver(sc.B, T, prefs.getFloat("fbR", 6), prefs.getFloat("eqR", 4.7f), prefs.getBoolean("cleanup", false), prefs.getBoolean("outside", false)).margin(prefs.getFloat("wmin", 0.5f)).solve();
             ui.post(() -> {
                 Scene ns = new Scene(); ns.B = sc.B; ns.ox = sc.ox; ns.oy = sc.oy; ns.target = T; ns.res = r; ns.opt = 0; scene = ns;
                 mode = Mode.PLAN; showPlanStatus(); refreshButtons(); overlay.invalidate();
@@ -279,30 +311,74 @@ public final class OverlayService extends Service {
     }
 
     // ---------------- tracking ----------------
+    // Two loops: "fb-track" follows the camera every frame by phase correlation against a reference frame with a known
+    // transform (~10-30 ms); "fb-work" keeps re-detecting with YOLO and, on a good match, makes that frame the new reference
+    // (removes drift and fixes zoom). Large moves re-base the reference on the current frame.
+    private static final double[] SCALES = {0.97, 1, 1.03};
     private volatile int trackGen;
     private void startTracking() {
         final int gen = ++trackGen;
+        Xf x0 = xf; float[] g0 = scanGrey;
+        if (ref == null && x0 != null && g0 != null) ref = Tracker.makeRef(g0, x0);
+        track.post(new Runnable() {
+            long last = 0; final float[] g = new float[Tracker.N];
+            @Override public void run() {
+                if (gen != trackGen || mode != Mode.PLAN) return;
+                if (!tracking) { track.postDelayed(this, 200); return; }
+                long ts = grey(last + 1, g);
+                Tracker.Ref r = ref;
+                if (ts < 0 || r == null) { track.postDelayed(this, 6); return; }
+                last = ts;
+                try {
+                    Xf base = (Xf) r.xf;
+                    if (base.capW != capW || base.capH != capH) { ref = null; track.postDelayed(this, 50); return; }
+                    Tracker.Est e = tracker.match(r, g, r.sc, SCALES);
+                    if (e.peak >= 0.12) {
+                        r.sc = e.sc; Xf x = derive(base, e); xf = x; lastFix = System.currentTimeMillis();
+                        if ((Math.abs(e.tx) > 0.2 * Tracker.W || Math.abs(e.ty) > 0.2 * Tracker.H || Math.abs(e.sc - 1) > 0.1) && e.peak >= 0.25 && ref == r)
+                            ref = Tracker.makeRef(g.clone(), x);
+                        ui.post(OverlayService.this::onFix);
+                    } else if (System.currentTimeMillis() - lastFix > 400) ui.post(() -> setLag(false));
+                } catch (Throwable ex) { ui.post(() -> setStatus("Трекинг: " + ex)); }
+                track.post(this);
+            }
+        });
         work.post(new Runnable() {
-            long last = 0;
+            long last = 0; final float[] g = new float[Tracker.N];
             @Override public void run() {
                 if (gen != trackGen || mode != Mode.PLAN) return;
                 if (!tracking) { work.postDelayed(this, 300); return; }
                 try {
                     ensureSize();
-                    Bitmap img = grab(last + 1);
-                    if (img == null) { work.postDelayed(this, 50); return; }
+                    Bitmap img = grab(last + 1, g);
+                    if (img == null) { work.postDelayed(this, 30); return; }
                     last = lastTs;
-                    List<Detector.Det> d = detector.detect(img, scale, null); img.recycle();
+                    Xf cur = xf; double k = scale;
+                    if (cur != null && scanA > 0) k = Math.max(0.4, Math.min(1.2, scale * scanA / cur.a));
+                    List<Detector.Det> d = detector.detect(img, k, null); img.recycle();
                     if (d.size() >= 6) {
-                        Detector.Lattice L = detector.fit(d);
-                        Xf x = align(d, L);
-                        if (x != null && gen == trackGen) { xf = x; ui.post(() -> { overlay.invalidate(); setLag(true); }); }
-                        else ui.post(() -> setLag(false));
-                    } else ui.post(() -> setLag(false));
+                        Xf x = align(d, detector.fit(d));
+                        if (x != null && gen == trackGen) {
+                            Tracker.Ref nr = Tracker.makeRef(g.clone(), x); Xf now = xf;
+                            if (now != null) nr.sc = now.a / x.a;  // camera zoom since that frame: prior for the tracker
+                            ref = nr;
+                        }
+                    }
                 } catch (Throwable e) { ui.post(() -> setStatus("Трекинг: " + e)); }
-                work.post(this);
+                work.postDelayed(this, 150);
             }
         });
+    }
+
+    private void onFix() { overlay.invalidate(); setLag(true); }
+
+    /** Transform of the current frame from the reference's: cur = sc * (ref - C) + C + t (screen px). */
+    private Xf derive(Xf r, Tracker.Est e) {
+        double fx = (Tracker.X1 - Tracker.X0) * r.capW / Tracker.W, fy = (Tracker.Y1 - Tracker.Y0) * r.capH / Tracker.H;
+        double Cx = Tracker.X0 * r.capW + Tracker.W / 2.0 * fx, Cy = Tracker.Y0 * r.capH + Tracker.H / 2.0 * fy;
+        Xf x = new Xf(); x.a = r.a * e.sc; x.b = r.b * e.sc; x.du = r.du; x.ds = r.ds; x.capW = r.capW; x.capH = r.capH; x.time = System.currentTimeMillis();
+        x.cx = e.sc * (r.cx - Cx) + Cx + e.tx * fx; x.cy = e.sc * (r.cy - Cy) + Cy + e.ty * fy;
+        return x;
     }
 
     private Xf align(List<Detector.Det> d, Detector.Lattice L) {

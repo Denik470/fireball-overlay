@@ -13,14 +13,14 @@ import java.util.Set;
  * Warden fireball planner (port of fireball-studio/studio.html solve()).
  * Grid: absolute tiles of the 50x50 map, buildings = footprints (x, y, w), platform centre = (x + w/2, y + w/2).
  * Rules (user spec 2026-11-09):
- *  - Warden spot A: |AX| < |AY| for every visible defence Y (X = target) -> intersection of bisector half-planes.
+ *  - Warden spot A: dist(A, footprint X) < dist(A, footprint Y) for every visible defence Y (X = target), margin >= wardenMin.
  *  - A deployable: inside the map, >= 1 tile from every footprint.
  *  - The 10 defences nearest X may be hidden by invis (all 2^10 subsets); fewest invis, every tolerance >= MIN_TOL,
  *    ties -> largest smallest tolerance.
  *  - Clean-up (optional): 1-2 defences whose centre is < 5 tiles from the deploy area count as killed by super balloons.
  */
 final class Solver {
-    static final double MIN_TOL = 0.2, WARDEN_MIN = 1.0, STEP = 0.25, CLEAN_DIST = 5, INVIS_R = 4.0;
+    static final double MIN_TOL = 0.2, STEP = 0.25, CLEAN_DIST = 5, INVIS_R = 4.0;
     static final int NEAR = 10, MAP = 50;
 
     static final Set<String> DEFENSES = new HashSet<>(java.util.Arrays.asList("Air Defense", "Air Sweeper", "Archer Tower", "Bomb Tower",
@@ -61,12 +61,14 @@ final class Solver {
         return Math.hypot(dx, dy);
     }
 
-    final List<Bld> B; final Bld T; final double fbR, eqR; final boolean cleanup, outsideOnly;
+    final List<Bld> B; final Bld T; final double fbR, eqR; final boolean cleanup, outsideOnly; double wardenMin = 0.5;
     float[] px, py, pd; int nP;
 
     Solver(List<Bld> B, Bld T, double fbR, double eqR, boolean cleanup, boolean outsideOnly) {
         this.B = B; this.T = T; this.fbR = fbR; this.eqR = eqR; this.cleanup = cleanup; this.outsideOnly = outsideOnly;
     }
+
+    Solver margin(double m) { wardenMin = m; return this; }
 
     byte[] blockedGrid() {
         byte[] g = new byte[MAP * MAP];
@@ -190,15 +192,12 @@ final class Solver {
         List<Bld> near = new ArrayList<>(defs.subList(0, Math.min(NEAR, defs.size()))), far = new ArrayList<>(defs.subList(near.size(), defs.size()));
         Map<Bld, float[]> M = new HashMap<>();
         for (Bld d : defs) {
-            double dcx = d.cx(), dcy = d.cy(), L2 = 2 * dist(dcx, dcy, tcx, tcy); float[] a = new float[nP];
-            if (L2 < 1e-6) L2 = 1e-6;
+            float[] a = new float[nP];
             for (int k = 0; k < nP; k++) {
                 double x = px[k], y = py[k];
-                // Margin = how far the Warden may drift before d becomes nearer than T. The game's distance metric
-                // (centre vs footprint edge) is not certain, so take the worse of both: 2x2 vs 3x3 differs by ~0.5 tile.
-                double centre = (((x - dcx) * (x - dcx) + (y - dcy) * (y - dcy)) - ((x - tcx) * (x - tcx) + (y - tcy) * (y - tcy))) / L2;
-                double edge = (distToFoot(x, y, d) - distToFoot(x, y, T)) / 2;
-                a[k] = (float) Math.min(centre, edge);
+                // Margin = how far the Warden may drift before d becomes nearer than T, by distance to the footprint edge
+                // (test 2026-11-10: a 3x3 tower beat a 2x2 target that was nearer by centre).
+                a[k] = (float) ((distToFoot(x, y, d) - distToFoot(x, y, T)) / 2);
             }
             M.put(d, a);
         }
@@ -247,7 +246,7 @@ final class Solver {
                     for (float[] a : vis) if (a[k] < v) { v = a[k]; if (v <= best) break; }
                     if (v > best) { best = v; arg = k; }
                 }
-                if (best < WARDEN_MIN) continue;  // the Warden walks a little before the ability: thin spots miss
+                if (best < wardenMin) continue;  // the Warden walks a little before the ability: thin spots miss
                 Plan p = new Plan(); p.S = S; p.C = C; p.k = coverK[inv]; p.margin = coverM[inv];
                 for (int g : coverMasks(inv)) p.zones.add(zone[g]);
                 p.wardenTol = best; p.wardenK = arg; p.minTol = Math.min(Math.min(p.margin, best), eqTol);
@@ -262,7 +261,7 @@ final class Solver {
             if (!dup) res.options.add(p);
         }
         for (Plan o : res.options) finish(o, near, far, splash, eq, M);
-        if (res.options.isEmpty()) res.error = "Бросок ненадёжен: нет точки для Хранителя с допуском ≥ " + WARDEN_MIN + " кл. Попробуй другую цель или подчистку.";
+        if (res.options.isEmpty()) res.error = "Бросок ненадёжен: нет точки для Хранителя с запасом ≥ " + wardenMin + " кл. Уменьши запас в настройках, включи подчистку или выбери другую цель.";
         res.ms = System.currentTimeMillis() - t0;
         return res;
     }

@@ -20,7 +20,7 @@ import android.widget.Toast;
 
 /** Settings + permission flow: overlay permission -> screen capture consent -> OverlayService. */
 public final class MainActivity extends Activity {
-    private static final float[] FB = {4, 5, 6}, EQ = {0, 3.5f, 3.8f, 4.1f, 4.4f, 4.7f};
+    private static final float[] FB = {4, 5, 6}, EQ = {0, 3.5f, 3.8f, 4.1f, 4.4f, 4.7f}, WM = {0.3f, 0.5f, 0.75f, 1f};
     private SharedPreferences prefs;
 
     @Override protected void onCreate(Bundle b) {
@@ -40,6 +40,8 @@ public final class MainActivity extends Activity {
         Spinner fb = spinner(new String[]{"ур. 1–8 (R 4)", "ур. 9–23 (R 5)", "ур. 24–27 (R 6)"}, FB, "fbR", 6); col.addView(fb);
         col.addView(label("Землетрясение"));
         Spinner eq = spinner(new String[]{"не нужен", "ур.1 R3.5", "ур.2 R3.8", "ур.3 R4.1", "ур.4 R4.4", "ур.5+ R4.7"}, EQ, "eqR", 4.7f); col.addView(eq);
+        col.addView(label("Запас для Хранителя (насколько можно промахнуться точкой)"));
+        col.addView(spinner(new String[]{"0,3 клетки — рискованно", "0,5 клетки", "0,75 клетки", "1 клетка — надёжно"}, WM, "wmin", 0.5f));
         col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup"));
         col.addView(check("Высадка только снаружи базы", "outside"));
         Button start = new Button(this); start.setText("Старт"); start.setOnClickListener(v -> start()); col.addView(start);
