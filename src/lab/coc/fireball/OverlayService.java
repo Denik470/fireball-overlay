@@ -273,6 +273,8 @@ public final class OverlayService extends Service {
             List<Solver.Bld> g = p.zones.get(i).group;
             for (int j = 0; j < g.size(); j++) t.append(j > 0 ? ", " : "").append(Solver.ru(g.get(j).name));
         }
+        t.append("\nПорядок: ").append(p.C.isEmpty() ? "" : "шары → ").append(p.eq != null ? "тряс → " : "")
+         .append("Хранитель → ").append(p.zones.isEmpty() ? "" : "инвизы → ").append("сразу способность");
         setStatus(t.toString());
     }
 

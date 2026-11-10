@@ -20,7 +20,7 @@ import java.util.Set;
  *  - Clean-up (optional): 1-2 defences whose centre is < 5 tiles from the deploy area count as killed by super balloons.
  */
 final class Solver {
-    static final double MIN_TOL = 0.2, STEP = 0.25, CLEAN_DIST = 5, INVIS_R = 4.0;
+    static final double MIN_TOL = 0.2, WARDEN_MIN = 1.0, STEP = 0.25, CLEAN_DIST = 5, INVIS_R = 4.0;
     static final int NEAR = 10, MAP = 50;
 
     static final Set<String> DEFENSES = new HashSet<>(java.util.Arrays.asList("Air Defense", "Air Sweeper", "Archer Tower", "Bomb Tower",
@@ -194,7 +194,11 @@ final class Solver {
             if (L2 < 1e-6) L2 = 1e-6;
             for (int k = 0; k < nP; k++) {
                 double x = px[k], y = py[k];
-                a[k] = (float) ((((x - dcx) * (x - dcx) + (y - dcy) * (y - dcy)) - ((x - tcx) * (x - tcx) + (y - tcy) * (y - tcy))) / L2);
+                // Margin = how far the Warden may drift before d becomes nearer than T. The game's distance metric
+                // (centre vs footprint edge) is not certain, so take the worse of both: 2x2 vs 3x3 differs by ~0.5 tile.
+                double centre = (((x - dcx) * (x - dcx) + (y - dcy) * (y - dcy)) - ((x - tcx) * (x - tcx) + (y - tcy) * (y - tcy))) / L2;
+                double edge = (distToFoot(x, y, d) - distToFoot(x, y, T)) / 2;
+                a[k] = (float) Math.min(centre, edge);
             }
             M.put(d, a);
         }
@@ -243,7 +247,7 @@ final class Solver {
                     for (float[] a : vis) if (a[k] < v) { v = a[k]; if (v <= best) break; }
                     if (v > best) { best = v; arg = k; }
                 }
-                if (best < MIN_TOL) continue;
+                if (best < WARDEN_MIN) continue;  // the Warden walks a little before the ability: thin spots miss
                 Plan p = new Plan(); p.S = S; p.C = C; p.k = coverK[inv]; p.margin = coverM[inv];
                 for (int g : coverMasks(inv)) p.zones.add(zone[g]);
                 p.wardenTol = best; p.wardenK = arg; p.minTol = Math.min(Math.min(p.margin, best), eqTol);
@@ -258,7 +262,7 @@ final class Solver {
             if (!dup) res.options.add(p);
         }
         for (Plan o : res.options) finish(o, near, far, splash, eq, M);
-        if (res.options.isEmpty()) res.error = "Бросок невозможен: нет точки для Хранителя с допуском ≥ " + MIN_TOL + " кл.";
+        if (res.options.isEmpty()) res.error = "Бросок ненадёжен: нет точки для Хранителя с допуском ≥ " + WARDEN_MIN + " кл. Попробуй другую цель или подчистку.";
         res.ms = System.currentTimeMillis() - t0;
         return res;
     }
