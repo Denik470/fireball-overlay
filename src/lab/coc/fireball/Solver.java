@@ -23,8 +23,8 @@ final class Solver {
     static final double MIN_TOL = 0.2, STEP = 0.25, CLEAN_DIST = 5, INVIS_R = 4.0;
     static final int NEAR = 10, MAP = 50;
 
-    // Builder's Huts (armed since TH14) and the Town Hall (Giga weapon) are targeted as defences too.
-    static final Set<String> DEFENSES = new HashSet<>(java.util.Arrays.asList("Air Defense", "Air Sweeper", "Archer Tower", "Bomb Tower", "Builders Hut", "Town Hall",
+    // Builder's Huts (armed since TH14) are targeted as defences too; the Town Hall is not (user, 2026-11-10).
+    static final Set<String> DEFENSES = new HashSet<>(java.util.Arrays.asList("Air Defense", "Air Sweeper", "Archer Tower", "Bomb Tower", "Builders Hut",
             "Cannon", "Crafting Station", "Eagle Artillery", "Firespitter", "Inferno Tower", "Monolith", "Mortar", "Multi Archer Tower",
             "Multi Gear Tower", "Revenge Tower", "Ricochet Cannon", "Scattershot", "Spell Tower", "Super Wizard Tower", "Wizard Tower", "X-Bow"));
     static final Map<String, String> RU = new HashMap<>();

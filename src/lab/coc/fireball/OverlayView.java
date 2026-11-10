@@ -124,7 +124,7 @@ final class OverlayView extends View {
         mv[0] = (float) x.a; mv[1] = (float) -x.a; mv[2] = (float) tx; mv[3] = (float) x.b; mv[4] = (float) x.b; mv[5] = (float) ty; mv[6] = 0; mv[7] = 0; mv[8] = 1;
         m.setValues(mv);
         boolean pick = mode == OverlayService.Mode.PICK; int view = svc.view;
-        if (mode == OverlayService.Mode.PLAN && view == 2) return;
+        if (mode == OverlayService.Mode.PLAN && (view == 2 || svc.autoHidden)) return;
         boolean full = view == 0 || mode != OverlayService.Mode.PLAN;
         Solver.Plan o = mode == OverlayService.Mode.PLAN ? sc.plan() : null; Solver.Bld T = sc.target;
         Geo g = geo; if (g == null || g.sc != sc || g.o != o || g.pick != pick) geo = g = build(sc, o, pick);

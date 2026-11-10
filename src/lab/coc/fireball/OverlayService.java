@@ -240,6 +240,7 @@ public final class OverlayService extends Service {
         List<Solver.Bld> all = new ArrayList<>();
         for (int j = 0; j < d.size(); j++) {
             Detector.Det x = d.get(j); int u = L.u[j], s = L.s[j];
+            if (x.name.startsWith("Hero ")) continue;
             double xc = (u + s) / 2.0, yc = (s - u) / 2.0;
             all.add(new Solver.Bld(x.name, x.w, xc - x.w / 2.0, yc - x.w / 2.0, x.conf, u, s));
         }
@@ -325,6 +326,7 @@ public final class OverlayService extends Service {
         Scene sc = scene; List<Solver.Bld> add = new ArrayList<>();
         for (int j = 0; j < d.size(); j++) {
             Detector.Det e = d.get(j); int u = L.u[j] + x.du, s = L.s[j] + x.ds;
+            if (e.name.startsWith("Hero ")) continue;
             double bx = (u + s) / 2.0 - e.w / 2.0 + sc.ox, by = (s - u) / 2.0 - e.w / 2.0 + sc.oy;
             if (overlaps(sc.B, bx, by, e.w) || overlaps(add, bx, by, e.w)) continue;
             String k = e.name + "@" + u + "," + s; int[] c = seen.get(k);
@@ -447,6 +449,7 @@ public final class OverlayService extends Service {
                     if (d.size() >= 6) {
                         Detector.Lattice L = detector.fit(d); Xf x = align(d, L);
                         if (x != null && gen == trackGen && mode == Mode.SURVEY) survey(d, L, x);
+                        if (x != null && gen == trackGen && mode == Mode.PLAN && !autoHidden) wardenCheck(d, L, x);
                         if (x != null && gen == trackGen) {
                             Tracker.Ref nr = Tracker.makeRef(g.clone(), x); Xf now = xf;
                             if (now != null) nr.sc = now.a / x.a;  // camera zoom since that frame: prior for the tracker
@@ -458,6 +461,25 @@ public final class OverlayService extends Service {
             }
         });
     }
+
+    // ---------------- hide the plan once the Warden is down ----------------
+    volatile boolean autoHidden; private int wardenHits;
+    /** A Grand Warden seen near the planned spot on 2 YOLO frames = deployed: hide the plan and collapse the panel. */
+    private void wardenCheck(List<Detector.Det> d, Detector.Lattice L, Xf x) {
+        Scene sc = scene; Solver.Plan p = sc.plan(); if (p == null || !prefs.getBoolean("hideOnDeploy", true)) return;
+        boolean near = false;
+        for (int j = 0; j < d.size(); j++) {
+            if (!d.get(j).name.equals("Hero Grand Warden")) continue;
+            int u = L.u[j] + x.du, s = L.s[j] + x.ds; double X = (u + s) / 2.0 + sc.ox, Y = (s - u) / 2.0 + sc.oy;
+            if (Math.hypot(X - p.wardenPt[0], Y - p.wardenPt[1]) < 6) near = true;
+        }
+        wardenHits = near ? wardenHits + 1 : 0;
+        if (wardenHits >= 2) {
+            wardenHits = 0; autoHidden = true;
+            ui.post(() -> { setCollapsed(true); setStatus("Хранитель высажен — план скрыт. Тап по 🔥 — вернуть"); overlay.invalidate(); });
+        }
+    }
+    private void unhide() { if (autoHidden) { autoHidden = false; overlay.invalidate(); } }
 
     private void onFix() { overlay.invalidate(); setLag(true); }
 
@@ -569,6 +591,7 @@ public final class OverlayService extends Service {
     }
 
     private void setCollapsed(boolean c) {
+        if (!c) unhide();
         collapsed = c; panel.setVisibility(c ? View.GONE : View.VISIBLE); mini.setVisibility(c ? View.VISIBLE : View.GONE);
         bubble.post(this::snap);
     }
@@ -599,9 +622,10 @@ public final class OverlayService extends Service {
     }
 
     private static final String[] VIEWS = {"Вид: всё", "Вид: метки", "Вид: скрыт"};
-    private void cycleView() { view = (view + 1) % 3; prefs.edit().putInt("view", view).apply(); overlay.invalidate(); refreshButtons(); }
+    private void cycleView() { if (autoHidden) { unhide(); return; } view = (view + 1) % 3; prefs.edit().putInt("view", view).apply(); overlay.invalidate(); refreshButtons(); }
 
     private void refreshButtons() {
+        if (mode == Mode.PLAN && shownMode != Mode.PLAN) { autoHidden = false; wardenHits = 0; }
         if (mode == Mode.PLAN && shownMode != Mode.PLAN && scene.plan() != null && prefs.getBoolean("autoMini", true)) setCollapsed(true);
         if (mode == Mode.PICK || mode == Mode.SURVEY) setCollapsed(false);
         shownMode = mode;

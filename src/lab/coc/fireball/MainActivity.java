@@ -45,6 +45,7 @@ public final class MainActivity extends Activity {
         col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup", false));
         col.addView(check("Хранитель только снаружи базы (рекомендуется)", "outside", true));
         col.addView(check("Сворачивать панель в кнопку 🔥, когда план готов", "autoMini", true));
+        col.addView(check("Скрывать план, когда Хранитель высажен", "hideOnDeploy", true));
         Button start = new Button(this); start.setText("Старт"); start.setOnClickListener(v -> start()); col.addView(start);
         Button stop = new Button(this); stop.setText("Стоп"); stop.setOnClickListener(v -> startService(new Intent(this, OverlayService.class).setAction(OverlayService.ACTION_STOP))); col.addView(stop);
         ScrollView sv = new ScrollView(this); sv.addView(col); setContentView(sv);
