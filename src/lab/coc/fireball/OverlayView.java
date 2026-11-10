@@ -123,27 +123,34 @@ final class OverlayView extends View {
         double tx = x.cx - loc[0] + x.a * (-sc.ox + sc.oy - x.du), ty = x.cy - loc[1] + x.b * (-sc.ox - sc.oy - x.ds);
         mv[0] = (float) x.a; mv[1] = (float) -x.a; mv[2] = (float) tx; mv[3] = (float) x.b; mv[4] = (float) x.b; mv[5] = (float) ty; mv[6] = 0; mv[7] = 0; mv[8] = 1;
         m.setValues(mv);
-        boolean pick = mode == OverlayService.Mode.PICK;
+        boolean pick = mode == OverlayService.Mode.PICK; int view = svc.view;
+        if (mode == OverlayService.Mode.PLAN && view == 2) return;
+        boolean full = view == 0 || mode != OverlayService.Mode.PLAN;
         Solver.Plan o = mode == OverlayService.Mode.PLAN ? sc.plan() : null; Solver.Bld T = sc.target;
         Geo g = geo; if (g == null || g.sc != sc || g.o != o || g.pick != pick) geo = g = build(sc, o, pick);
         if (o != null) {
-            for (int k = 0; k < 4; k++) paint(c, g.area[k], ((int) (255 * (0.25 + 0.18 * k)) << 24) | 0x28BEFF);
-            for (Path p : g.bind) stroke(c, p, 0xFF78D7FF, 2, dash8);
+            if (full) {
+                for (int k = 0; k < 4; k++) paint(c, g.area[k], ((int) (255 * (0.25 + 0.18 * k)) << 24) | 0x28BEFF);
+                for (Path p : g.bind) stroke(c, p, 0xFF78D7FF, 2, dash8);
+            }
             double[] wp = o.wardenPt;
             aim(c, wp[0], wp[1], 0xFF8FE3FF); label(c, wp[0] + 1.1, wp[1] + 1.1, "ДЕД ±" + String.format("%.1f", o.wardenTol), 0xFF8FE3FF);
             stroke(c, g.cleanX, 0xFFFF1744, 4, null);
-            paint(c, g.fb, 0x1AFF8C00); stroke(c, g.fb, 0xF2FF8C00, 2, null); paint(c, g.splash, 0x40FF8C00);
+            if (full) { paint(c, g.fb, 0x1AFF8C00); paint(c, g.splash, 0x40FF8C00); }
+            stroke(c, g.fb, 0xF2FF8C00, full ? 2 : 1.2f, null);
             for (int i = 0; i < o.zones.size(); i++) {
                 Solver.Zone z = o.zones.get(i);
-                paint(c, g.zEdge.get(i), g.zColor.get(i)); stroke(c, g.zCircle.get(i), 0xE6BE78FF, 1.5f, dash6); stroke(c, g.zGroup.get(i), 0xFFC88CFF, 2.5f, null);
+                if (full) { paint(c, g.zEdge.get(i), g.zColor.get(i)); stroke(c, g.zGroup.get(i), 0xFFC88CFF, 2.5f, null); }
+                stroke(c, g.zCircle.get(i), 0xE6BE78FF, 1.5f, dash6);
                 aim(c, z.centre[0], z.centre[1], 0xFFFFFFFF); label(c, z.centre[0], z.centre[1] - 0.8, "ИНВИЗ " + (i + 1), 0xFFE2C6FF);
             }
             if (o.eq != null) {
-                paint(c, g.eqEdge, 0xFFFFAA3C); stroke(c, g.eqCircle, 0xFFFFAA3C, 2.5f, dash10);
+                if (full) paint(c, g.eqEdge, 0xFFFFAA3C);
+                stroke(c, g.eqCircle, 0xFFFFAA3C, 2.5f, dash10);
                 aim(c, o.eq.centre[0], o.eq.centre[1], 0xFFFFAA3C); label(c, o.eq.centre[0] + 1.1, o.eq.centre[1] + 1.1, "ТРЯС ±" + String.format("%.1f", o.eq.tol), 0xFFFFC27A);
             }
         }
-        stroke(c, g.ok, pick ? 0xCCFFFFFF : 0x80FFFFFF, pick ? 1.5f : 1, null); stroke(c, g.weak, 0xFFFFD54A, pick ? 2 : 1.2f, null);
+        if (full) { stroke(c, g.ok, pick ? 0xCCFFFFFF : 0x80FFFFFF, pick ? 1.5f : 1, null); stroke(c, g.weak, 0xFFFFD54A, pick ? 2 : 1.2f, null); }
         if (pick) for (Solver.Bld b : sc.B) if (b.def) label(c, b.cx(), b.cy(), Solver.ru(b.name) + (b.conf < 0.6 ? " ?" : ""), b.conf < 0.6 ? 0xFFFFD54A : 0xFFFFFFFF);
         if (T != null) { paint(c, g.target, 0x59FF2828); stroke(c, g.target, 0xFFFF3B3B, 3, null); label(c, T.cx(), T.cy(), Solver.ru(T.name), 0xFFFF6B6B); }
     }

@@ -44,6 +44,7 @@ public final class MainActivity extends Activity {
         col.addView(spinner(new String[]{"0,3 клетки — рискованно", "0,5 клетки", "0,75 клетки", "1 клетка — надёжно"}, WM, "wmin", 0.5f));
         col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup", false));
         col.addView(check("Хранитель только снаружи базы (рекомендуется)", "outside", true));
+        col.addView(check("Сворачивать панель в кнопку 🔥, когда план готов", "autoMini", true));
         Button start = new Button(this); start.setText("Старт"); start.setOnClickListener(v -> start()); col.addView(start);
         Button stop = new Button(this); stop.setText("Стоп"); stop.setOnClickListener(v -> startService(new Intent(this, OverlayService.class).setAction(OverlayService.ACTION_STOP))); col.addView(stop);
         ScrollView sv = new ScrollView(this); sv.addView(col); setContentView(sv);

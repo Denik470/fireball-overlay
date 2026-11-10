@@ -493,8 +493,16 @@ public final class OverlayService extends Service {
     }
 
     // ---------------- windows ----------------
+    // The panel collapses into a small round button (tap: open, drag: move, snaps to the nearest side edge).
+    // It collapses by itself once a plan is ready. "Вид" cycles the drawing: full plan / marks only / hidden.
+    volatile int view;  // 0 full, 1 marks only, 2 hidden
+    private boolean collapsed; private Mode shownMode = Mode.IDLE;
+    private LinearLayout panel; private TextView mini; private GradientDrawable miniBg; private boolean statusOpen;
+    private float dp() { return getResources().getDisplayMetrics().density; }
+
     private void addWindows() {
         int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+        view = prefs.getInt("view", 0);
         overlay = new OverlayView(this);
         overlayLp = new WindowManager.LayoutParams(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.MATCH_PARENT, type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
@@ -504,18 +512,65 @@ public final class OverlayService extends Service {
         if (Build.VERSION.SDK_INT >= 28) overlayLp.layoutInDisplayCutoutMode = Build.VERSION.SDK_INT >= 30 ? 3 : 1;
         wm.addView(overlay, overlayLp);
 
-        float dp = getResources().getDisplayMetrics().density;
+        float dp = dp();
         bubble = new LinearLayout(this); bubble.setOrientation(LinearLayout.VERTICAL);
-        GradientDrawable bg = new GradientDrawable(); bg.setColor(0xE0141820); bg.setCornerRadius(12 * dp); bg.setStroke((int) dp, 0x60FFFFFF);
-        bubble.setBackground(bg); bubble.setPadding((int) (6 * dp), (int) (4 * dp), (int) (6 * dp), (int) (4 * dp));
+        panel = new LinearLayout(this); panel.setOrientation(LinearLayout.VERTICAL);
+        GradientDrawable bg = new GradientDrawable(); bg.setColor(0xD0141820); bg.setCornerRadius(12 * dp); bg.setStroke((int) dp, 0x50FFFFFF);
+        panel.setBackground(bg); panel.setPadding((int) (4 * dp), (int) (3 * dp), (int) (4 * dp), (int) (3 * dp));
         buttons = new LinearLayout(this); buttons.setOrientation(LinearLayout.HORIZONTAL); buttons.setGravity(Gravity.CENTER_VERTICAL);
-        status = new TextView(this); status.setTextColor(0xFFDDE3EA); status.setTextSize(11); status.setMaxWidth((int) (300 * dp));
-        bubble.addView(buttons); bubble.addView(status);
+        status = new TextView(this); status.setTextColor(0xFFDDE3EA); status.setTextSize(11); status.setMaxWidth((int) (320 * dp));
+        status.setPadding((int) (4 * dp), 0, (int) (4 * dp), (int) (2 * dp)); status.setMaxLines(2); status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        status.setOnClickListener(v -> { statusOpen = !statusOpen; status.setMaxLines(statusOpen ? 20 : 2); });
+        panel.addView(buttons); panel.addView(status);
+        mini = new TextView(this); mini.setText("🔥"); mini.setTextSize(18); mini.setGravity(Gravity.CENTER);
+        miniBg = new GradientDrawable(); miniBg.setShape(GradientDrawable.OVAL); miniBg.setColor(0xB0141820); miniBg.setStroke((int) (3 * dp), 0xFF777777);
+        mini.setBackground(miniBg); int sz = (int) (44 * dp); mini.setLayoutParams(new LinearLayout.LayoutParams(sz, sz));
+        bubble.addView(panel); bubble.addView(mini);
         bubbleLp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT);
-        bubbleLp.gravity = Gravity.TOP | Gravity.LEFT; bubbleLp.x = (int) (8 * dp); bubbleLp.y = (int) (60 * dp);
+        bubbleLp.gravity = Gravity.TOP | Gravity.LEFT;
+        bubbleLp.x = prefs.getInt("bx", (int) (8 * dp)); bubbleLp.y = prefs.getInt("by", (int) (60 * dp));
         if (Build.VERSION.SDK_INT >= 28) bubbleLp.layoutInDisplayCutoutMode = Build.VERSION.SDK_INT >= 30 ? 3 : 1;
         wm.addView(bubble, bubbleLp);
+        mini.setOnTouchListener(dragger(true));
+        setCollapsed(false);
+    }
+
+    /** Drag the floating window; a short touch without movement is a tap (opens the panel when `tapOpens`). */
+    private View.OnTouchListener dragger(boolean tapOpens) {
+        return new View.OnTouchListener() {
+            float sx, sy; int bx, by; boolean moved;
+            @Override public boolean onTouch(View v, MotionEvent e) {
+                switch (e.getAction()) {
+                    case MotionEvent.ACTION_DOWN: sx = e.getRawX(); sy = e.getRawY(); bx = bubbleLp.x; by = bubbleLp.y; moved = false; return true;
+                    case MotionEvent.ACTION_MOVE:
+                        if (Math.abs(e.getRawX() - sx) + Math.abs(e.getRawY() - sy) > 12 * dp()) moved = true;
+                        if (moved) { bubbleLp.x = bx + (int) (e.getRawX() - sx); bubbleLp.y = by + (int) (e.getRawY() - sy); wm.updateViewLayout(bubble, bubbleLp); }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                        if (!moved) {
+                            if (tapOpens && e.getEventTime() - e.getDownTime() > 450 && mode == Mode.PLAN) cycleView();  // long press: switch view
+                            else if (tapOpens) setCollapsed(false);
+                            return true;
+                        }
+                        snap(); return true;
+                }
+                return true;
+            }
+        };
+    }
+
+    private void snap() {
+        int w = screenSize()[0], bw = bubble.getWidth();
+        bubbleLp.x = bubbleLp.x + bw / 2 < w / 2 ? (int) (4 * dp()) : Math.max(0, w - bw - (int) (4 * dp()));
+        bubbleLp.y = Math.max(0, bubbleLp.y);
+        wm.updateViewLayout(bubble, bubbleLp);
+        prefs.edit().putInt("bx", bubbleLp.x).putInt("by", bubbleLp.y).apply();
+    }
+
+    private void setCollapsed(boolean c) {
+        collapsed = c; panel.setVisibility(c ? View.GONE : View.VISIBLE); mini.setVisibility(c ? View.VISIBLE : View.GONE);
+        bubble.post(this::snap);
     }
 
     private void setPick(boolean on) {
@@ -525,31 +580,34 @@ public final class OverlayService extends Service {
     }
 
     private TextView lagDot;
-    private void setLag(boolean ok) { if (lagDot != null) lagDot.setTextColor(ok ? 0xFF3DDC84 : 0xFFFF5A5A); }
+    private void setLag(boolean ok) {
+        int c = ok ? 0xFF3DDC84 : 0xFFFF5A5A;
+        if (lagDot != null) lagDot.setTextColor(c);
+        if (miniBg != null) miniBg.setStroke((int) (3 * dp()), mode == Mode.PLAN || mode == Mode.SURVEY ? c : 0xFF777777);
+    }
 
     private void setStatus(String t) { status.setText(t); }
 
     private TextView button(String text, int color, View.OnClickListener l) {
-        float dp = getResources().getDisplayMetrics().density;
-        TextView b = new TextView(this); b.setText(text); b.setTextColor(Color.WHITE); b.setTextSize(13); b.setGravity(Gravity.CENTER);
+        float dp = dp();
+        TextView b = new TextView(this); b.setText(text); b.setTextColor(Color.WHITE); b.setTextSize(12); b.setGravity(Gravity.CENTER);
         GradientDrawable bg = new GradientDrawable(); bg.setColor(color); bg.setCornerRadius(8 * dp); b.setBackground(bg);
-        b.setPadding((int) (10 * dp), (int) (6 * dp), (int) (10 * dp), (int) (6 * dp));
+        b.setPadding((int) (8 * dp), (int) (6 * dp), (int) (8 * dp), (int) (6 * dp)); b.setMinWidth((int) (36 * dp));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins((int) (3 * dp), (int) (2 * dp), (int) (3 * dp), (int) (2 * dp)); b.setLayoutParams(lp);
+        lp.setMargins((int) (2 * dp), (int) (2 * dp), (int) (2 * dp), (int) (2 * dp)); b.setLayoutParams(lp);
         b.setOnClickListener(l); return b;
     }
 
+    private static final String[] VIEWS = {"Вид: всё", "Вид: метки", "Вид: скрыт"};
+    private void cycleView() { view = (view + 1) % 3; prefs.edit().putInt("view", view).apply(); overlay.invalidate(); refreshButtons(); }
+
     private void refreshButtons() {
+        if (mode == Mode.PLAN && shownMode != Mode.PLAN && scene.plan() != null && prefs.getBoolean("autoMini", true)) setCollapsed(true);
+        if (mode == Mode.PICK || mode == Mode.SURVEY) setCollapsed(false);
+        shownMode = mode;
         buttons.removeAllViews(); lagDot = null;
-        TextView drag = new TextView(this); drag.setText("⠿"); drag.setTextColor(0xFFAAB4C0); drag.setTextSize(20); drag.setPadding(8, 0, 12, 0);
-        drag.setOnTouchListener(new View.OnTouchListener() {
-            float sx, sy; int bx, by;
-            @Override public boolean onTouch(View v, MotionEvent e) {
-                if (e.getAction() == MotionEvent.ACTION_DOWN) { sx = e.getRawX(); sy = e.getRawY(); bx = bubbleLp.x; by = bubbleLp.y; return true; }
-                if (e.getAction() == MotionEvent.ACTION_MOVE) { bubbleLp.x = bx + (int) (e.getRawX() - sx); bubbleLp.y = by + (int) (e.getRawY() - sy); wm.updateViewLayout(bubble, bubbleLp); return true; }
-                return true;
-            }
-        });
+        TextView drag = new TextView(this); drag.setText("⠿"); drag.setTextColor(0xFFAAB4C0); drag.setTextSize(18); drag.setPadding((int) (4 * dp()), 0, (int) (6 * dp()), 0);
+        drag.setOnTouchListener(dragger(false));
         buttons.addView(drag);
         switch (mode) {
             case IDLE: buttons.addView(button("Скан", 0xFF2E7D32, v -> scan())); break;
@@ -562,6 +620,7 @@ public final class OverlayService extends Service {
                 buttons.addView(button("Авто", 0xFF1565C0, v -> autoTarget()));
                 buttons.addView(button("Отмена", 0xFF555555, v -> { setPick(false); mode = Mode.IDLE; scene = new Scene(); overlay.invalidate(); setStatus("Нажми «Скан»"); refreshButtons(); })); break;
             case PLAN:
+                buttons.addView(button("👁 " + VIEWS[view].substring(5), 0xFF37474F, v -> cycleView()));
                 Scene sc = scene; int n = sc.res == null ? 0 : sc.res.options.size();
                 if (n > 1) buttons.addView(button("Вар " + (sc.opt + 1) + "/" + n, 0xFF1565C0, v -> {
                     Scene cur = scene; Scene ns = new Scene(); ns.B = cur.B; ns.ox = cur.ox; ns.oy = cur.oy; ns.target = cur.target; ns.res = cur.res;
@@ -573,6 +632,7 @@ public final class OverlayService extends Service {
                 buttons.addView(button("Скан", 0xFF2E7D32, v -> { trackGen++; scan(); }));
                 break;
         }
+        if (mode != Mode.BUSY) buttons.addView(button("—", 0xFF37474F, v -> setCollapsed(true)));
         buttons.addView(button("✕", 0xFF8E2424, v -> stopSelf()));
     }
 }
