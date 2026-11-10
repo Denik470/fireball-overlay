@@ -46,7 +46,7 @@ import java.util.Set;
  */
 public final class OverlayService extends Service {
     static final String ACTION_STOP = "lab.coc.fireball.STOP";
-    enum Mode { IDLE, BUSY, PICK, PLAN }
+    enum Mode { IDLE, BUSY, SURVEY, PICK, PLAN }
 
     /** Screen transform: grid -> capture px: u = (X-ox)-(Y-oy)-du, s = (X-ox)+(Y-oy)-ds; px = cx + a*u, py = cy + b*s. */
     static final class Xf { double a, b, cx, cy; int du, ds; double capW, capH; long time; }
@@ -229,9 +229,9 @@ public final class OverlayService extends Service {
             ui.post(() -> {
                 overlay.setVisibility(View.VISIBLE); bubble.setVisibility(View.VISIBLE);
                 if (fe != null) { mode = Mode.IDLE; setStatus("Ошибка: " + fe); refreshButtons(); return; }
-                scene = fs; xf = fx; ref = null; mode = Mode.PICK; setPick(true);
-                int nd = 0; for (Solver.Bld b : fs.B) if (b.def) nd++;
-                setStatus("Найдено защит: " + nd + " (" + ms + " мс). Тапни по цели"); refreshButtons(); overlay.invalidate();
+                scene = fs; xf = fx; ref = null; seen.clear(); mode = Mode.SURVEY;
+                setStatus(surveyText(fs) + " (" + ms + " мс).\nМедленно проведи камерой по всей базе, затем «Готово»"); refreshButtons(); overlay.invalidate();
+                startTracking();
             });
         }, 60);
     }
@@ -281,7 +281,7 @@ public final class OverlayService extends Service {
         final Solver.Bld T = best; mode = Mode.BUSY; setPick(false);
         setStatus("Цель: " + Solver.ru(T.name) + ". Считаю…"); refreshButtons();
         work.post(() -> {
-            Solver.Result r = new Solver(sc.B, T, prefs.getFloat("fbR", 6), prefs.getFloat("eqR", 4.7f), prefs.getBoolean("cleanup", false), prefs.getBoolean("outside", false)).margin(prefs.getFloat("wmin", 0.5f)).solve();
+            Solver.Result r = solver(sc.B, T).solve();
             ui.post(() -> {
                 Scene ns = new Scene(); ns.B = sc.B; ns.ox = sc.ox; ns.oy = sc.oy; ns.target = T; ns.res = r; ns.opt = 0; scene = ns;
                 mode = Mode.PLAN; showPlanStatus(); refreshButtons(); overlay.invalidate();
@@ -299,6 +299,8 @@ public final class OverlayService extends Service {
          .append(" · дед ±").append(String.format("%.1f", p.wardenTol));
         if (p.eq != null) t.append(" · тряс ±").append(String.format("%.1f", p.eq.tol));
         if (!p.C.isEmpty()) t.append(" · шары: ").append(p.C.size());
+        int sd = 0; for (Solver.Bld b : p.splash) if (b.def && b != sc.target) sd++;
+        t.append(" · во всплеске защит: ").append(sd);
         t.append(" · ").append(sc.res.ms).append(" мс");
         for (int i = 0; i < p.zones.size(); i++) {
             t.append("\nИнвиз ").append(i + 1).append(": ");
@@ -308,6 +310,92 @@ public final class OverlayService extends Service {
         t.append("\nПорядок: ").append(p.C.isEmpty() ? "" : "шары → ").append(p.eq != null ? "тряс → " : "")
          .append("Хранитель → ").append(p.zones.isEmpty() ? "" : "инвизы → ").append("сразу способность");
         setStatus(t.toString());
+    }
+
+    // ---------------- survey: grow the base while the camera pans ----------------
+    /** Sightings of not-yet-known buildings, key name@u,s (scan lattice frame); added after 2 sightings. */
+    private final Map<String, int[]> seen = new HashMap<>();
+
+    private static String surveyText(Scene sc) {
+        int nd = 0; for (Solver.Bld b : sc.B) if (b.def) nd++;
+        return "Зданий: " + sc.B.size() + ", защит: " + nd;
+    }
+
+    private void survey(List<Detector.Det> d, Detector.Lattice L, Xf x) {
+        Scene sc = scene; List<Solver.Bld> add = new ArrayList<>();
+        for (int j = 0; j < d.size(); j++) {
+            Detector.Det e = d.get(j); int u = L.u[j] + x.du, s = L.s[j] + x.ds;
+            double bx = (u + s) / 2.0 - e.w / 2.0 + sc.ox, by = (s - u) / 2.0 - e.w / 2.0 + sc.oy;
+            if (overlaps(sc.B, bx, by, e.w) || overlaps(add, bx, by, e.w)) continue;
+            String k = e.name + "@" + u + "," + s; int[] c = seen.get(k);
+            if (c == null) { seen.put(k, new int[]{1}); continue; }
+            if (++c[0] >= 2) add.add(new Solver.Bld(e.name, e.w, bx, by, e.conf, u, s));
+        }
+        if (add.isEmpty()) return;
+        Scene ns = new Scene(); ns.B = new ArrayList<>(sc.B); ns.B.addAll(add); ns.ox = sc.ox; ns.oy = sc.oy;
+        buildIndex(ns); scene = ns;
+        ui.post(() -> { if (mode == Mode.SURVEY) { setStatus(surveyText(ns) + "\nВеди камеру дальше или жми «Готово»"); overlay.invalidate(); } });
+    }
+
+    private static boolean overlaps(List<Solver.Bld> B, double x, double y, int w) {
+        for (Solver.Bld k : B) {
+            double ov = Math.max(0, Math.min(k.x + k.w, x + w) - Math.max(k.x, x)) * Math.max(0, Math.min(k.y + k.w, y + w) - Math.max(k.y, y));
+            if (ov > 0.5 * Math.pow(Math.min(k.w, w), 2)) return true;
+        }
+        return false;
+    }
+
+    /** End of survey: re-centre the whole base on the 50x50 map, then pick the target. */
+    private void finishSurvey() {
+        trackGen++; Scene sc = scene;
+        double x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+        for (Solver.Bld b : sc.B) { x0 = Math.min(x0, b.x); x1 = Math.max(x1, b.x + b.w); y0 = Math.min(y0, b.y); y1 = Math.max(y1, b.y + b.w); }
+        int dx = (int) Math.round(Solver.MAP / 2.0 - (x0 + x1) / 2), dy = (int) Math.round(Solver.MAP / 2.0 - (y0 + y1) / 2);
+        List<Solver.Bld> nb = new ArrayList<>();
+        for (Solver.Bld b : sc.B) nb.add(new Solver.Bld(b.name, b.w, b.x + dx, b.y + dy, b.conf, b.u, b.s));
+        Scene ns = new Scene(); ns.B = nb; ns.ox = sc.ox + dx; ns.oy = sc.oy + dy; scene = ns;
+        mode = Mode.PICK; setPick(true);
+        setStatus(surveyText(ns) + ". Тапни по цели или «Авто» — подберу лучшую"); refreshButtons(); overlay.invalidate();
+    }
+
+    // ---------------- auto target ----------------
+    /** Splash value of a target: defences in the fireball radius count 1, other buildings 0.2. */
+    static double splashValue(List<Solver.Bld> B, Solver.Bld T, double R) {
+        double v = 0, cx = T.cx(), cy = T.cy();
+        for (Solver.Bld b : B) if (b != T && !b.name.equals("Wall") && Solver.distToFoot(cx, cy, b) <= R) v += b.def ? 1 : 0.2;
+        return v;
+    }
+
+    private void autoTarget() {
+        Scene sc = scene; if (sc == null || mode != Mode.PICK) return;
+        mode = Mode.BUSY; setPick(false); setStatus("Подбираю цель…"); refreshButtons();
+        work.post(() -> {
+            float fbR = prefs.getFloat("fbR", 6);
+            List<Solver.Bld> cand = new ArrayList<>(); for (Solver.Bld b : sc.B) if (b.def) cand.add(b);
+            final Map<Solver.Bld, Double> val = new HashMap<>(); for (Solver.Bld b : cand) val.put(b, splashValue(sc.B, b, fbR));
+            cand.sort((p, q) -> Double.compare(val.get(q), val.get(p)));
+            Solver.Bld bestT = null; Solver.Result bestR = null; double bestS = -1e9; int tried = 0;
+            for (Solver.Bld T : cand) {
+                if (tried >= 10) break; tried++;
+                final int nT = tried; ui.post(() -> setStatus("Подбираю цель… " + nT + "/10"));
+                Solver.Result r = solver(sc.B, T).solve();
+                if (r.options.isEmpty()) continue;
+                Solver.Plan p = r.options.get(0);
+                double score = val.get(T) - 0.7 * p.k - 0.3 * p.C.size() + 0.5 * Math.min(p.minTol, 1.5);
+                if (score > bestS) { bestS = score; bestT = T; bestR = r; }
+            }
+            final Solver.Bld T = bestT; final Solver.Result R = bestR; final double v = T == null ? 0 : val.get(T);
+            ui.post(() -> {
+                if (T == null) { mode = Mode.PICK; setPick(true); setStatus("Надёжного броска не нашёл. Уменьши запас или выбери цель вручную"); refreshButtons(); return; }
+                Scene ns = new Scene(); ns.B = sc.B; ns.ox = sc.ox; ns.oy = sc.oy; ns.target = T; ns.res = R; ns.opt = 0; scene = ns;
+                mode = Mode.PLAN; showPlanStatus(); refreshButtons(); overlay.invalidate(); startTracking();
+            });
+        });
+    }
+
+    private Solver solver(List<Solver.Bld> B, Solver.Bld T) {
+        return new Solver(B, T, prefs.getFloat("fbR", 6), prefs.getFloat("eqR", 4.7f), prefs.getBoolean("cleanup", false), prefs.getBoolean("outside", true))
+                .margin(prefs.getFloat("wmin", 0.5f));
     }
 
     // ---------------- tracking ----------------
@@ -323,7 +411,7 @@ public final class OverlayService extends Service {
         track.post(new Runnable() {
             long last = 0; final float[] g = new float[Tracker.N];
             @Override public void run() {
-                if (gen != trackGen || mode != Mode.PLAN) return;
+                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY)) return;
                 if (!tracking) { track.postDelayed(this, 200); return; }
                 long ts = grey(last + 1, g);
                 Tracker.Ref r = ref;
@@ -346,7 +434,7 @@ public final class OverlayService extends Service {
         work.post(new Runnable() {
             long last = 0; final float[] g = new float[Tracker.N];
             @Override public void run() {
-                if (gen != trackGen || mode != Mode.PLAN) return;
+                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY)) return;
                 if (!tracking) { work.postDelayed(this, 300); return; }
                 try {
                     ensureSize();
@@ -357,7 +445,8 @@ public final class OverlayService extends Service {
                     if (cur != null && scanA > 0) k = Math.max(0.4, Math.min(1.2, scale * scanA / cur.a));
                     List<Detector.Det> d = detector.detect(img, k, null); img.recycle();
                     if (d.size() >= 6) {
-                        Xf x = align(d, detector.fit(d));
+                        Detector.Lattice L = detector.fit(d); Xf x = align(d, L);
+                        if (x != null && gen == trackGen && mode == Mode.SURVEY) survey(d, L, x);
                         if (x != null && gen == trackGen) {
                             Tracker.Ref nr = Tracker.makeRef(g.clone(), x); Xf now = xf;
                             if (now != null) nr.sc = now.a / x.a;  // camera zoom since that frame: prior for the tracker
@@ -365,7 +454,7 @@ public final class OverlayService extends Service {
                         }
                     }
                 } catch (Throwable e) { ui.post(() -> setStatus("Трекинг: " + e)); }
-                work.postDelayed(this, 150);
+                work.postDelayed(this, mode == Mode.SURVEY ? 0 : 150);
             }
         });
     }
@@ -465,7 +554,13 @@ public final class OverlayService extends Service {
         switch (mode) {
             case IDLE: buttons.addView(button("Скан", 0xFF2E7D32, v -> scan())); break;
             case BUSY: break;
-            case PICK: buttons.addView(button("Отмена", 0xFF555555, v -> { setPick(false); mode = Mode.IDLE; scene = new Scene(); overlay.invalidate(); setStatus("Нажми «Скан»"); refreshButtons(); })); break;
+            case SURVEY:
+                buttons.addView(button("Готово", 0xFF2E7D32, v -> finishSurvey()));
+                lagDot = new TextView(this); lagDot.setText("●"); lagDot.setTextColor(0xFF3DDC84); lagDot.setPadding(4, 0, 4, 0); buttons.addView(lagDot);
+                break;
+            case PICK:
+                buttons.addView(button("Авто", 0xFF1565C0, v -> autoTarget()));
+                buttons.addView(button("Отмена", 0xFF555555, v -> { setPick(false); mode = Mode.IDLE; scene = new Scene(); overlay.invalidate(); setStatus("Нажми «Скан»"); refreshButtons(); })); break;
             case PLAN:
                 Scene sc = scene; int n = sc.res == null ? 0 : sc.res.options.size();
                 if (n > 1) buttons.addView(button("Вар " + (sc.opt + 1) + "/" + n, 0xFF1565C0, v -> {

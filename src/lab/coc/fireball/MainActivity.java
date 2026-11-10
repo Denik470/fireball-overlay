@@ -32,8 +32,8 @@ public final class MainActivity extends Activity {
         TextView help = new TextView(this); help.setTextSize(14); help.setPadding(0, pad / 2, 0, pad);
         help.setText("1. Нажми «Старт», разреши показ поверх других приложений и запись экрана.\n" +
                 "   В окне записи лучше выбрать «Одно приложение» → Clash of Clans: тогда оверлей не попадает в кадр.\n" +
-                "2. В атаке (фаза разведки) открой базу и нажми «Скан» на плашке.\n" +
-                "3. Тапни по цели. План рисуется поверх игры и следует за камерой (Трек ●).\n" +
+                "2. В атаке (фаза разведки) нажми «Скан» и медленно проведи камерой по всей базе, затем «Готово».\n" +
+                "3. Тапни по цели или нажми «Авто» — подберу цель, где файер заденет больше защит. План рисуется поверх игры и следует за камерой (Трек ●).\n" +
                 "Голубая зона — где ставить Хранителя, белые прицелы — инвизы, оранжевый — тряс и всплеск файербола.");
         col.addView(help);
         col.addView(label("Файербол Хранителя"));
@@ -42,8 +42,8 @@ public final class MainActivity extends Activity {
         Spinner eq = spinner(new String[]{"не нужен", "ур.1 R3.5", "ур.2 R3.8", "ур.3 R4.1", "ур.4 R4.4", "ур.5+ R4.7"}, EQ, "eqR", 4.7f); col.addView(eq);
         col.addView(label("Запас для Хранителя (насколько можно промахнуться точкой)"));
         col.addView(spinner(new String[]{"0,3 клетки — рискованно", "0,5 клетки", "0,75 клетки", "1 клетка — надёжно"}, WM, "wmin", 0.5f));
-        col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup"));
-        col.addView(check("Высадка только снаружи базы", "outside"));
+        col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup", false));
+        col.addView(check("Хранитель только снаружи базы (рекомендуется)", "outside", true));
         Button start = new Button(this); start.setText("Старт"); start.setOnClickListener(v -> start()); col.addView(start);
         Button stop = new Button(this); stop.setText("Стоп"); stop.setOnClickListener(v -> startService(new Intent(this, OverlayService.class).setAction(OverlayService.ACTION_STOP))); col.addView(stop);
         ScrollView sv = new ScrollView(this); sv.addView(col); setContentView(sv);
@@ -65,8 +65,8 @@ public final class MainActivity extends Activity {
         return s;
     }
 
-    private CheckBox check(String t, String key) {
-        CheckBox c = new CheckBox(this); c.setText(t); c.setChecked(prefs.getBoolean(key, false));
+    private CheckBox check(String t, String key, boolean def) {
+        CheckBox c = new CheckBox(this); c.setText(t); c.setChecked(prefs.getBoolean(key, def));
         c.setOnCheckedChangeListener((v, on) -> prefs.edit().putBoolean(key, on).apply()); return c;
     }
 

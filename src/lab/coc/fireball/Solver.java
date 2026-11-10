@@ -75,18 +75,30 @@ final class Solver {
         for (Bld b : B) for (int i = (int) Math.floor(b.x) - 1; i < Math.ceil(b.x + b.w) + 1; i++) for (int j = (int) Math.floor(b.y) - 1; j < Math.ceil(b.y + b.w) + 1; j++)
             if (i >= 0 && j >= 0 && i < MAP && j < MAP) g[i * MAP + j] = 1;
         if (outsideOnly) {
+            // Outside of the base only. Flood from the map edge through cells >= 2 tiles from every footprint, so pockets
+            // and narrow alleys inside the base (often a missed building or decoration) are not reachable; then allow free
+            // cells next to the reached area (the 1-2 tile band along the outer edge).
+            byte[] wide = new byte[MAP * MAP];
+            for (Bld b : B) for (int i = (int) Math.floor(b.x) - 2; i < Math.ceil(b.x + b.w) + 2; i++) for (int j = (int) Math.floor(b.y) - 2; j < Math.ceil(b.y + b.w) + 2; j++)
+                if (i >= 0 && j >= 0 && i < MAP && j < MAP) wide[i * MAP + j] = 1;
             byte[] seen = new byte[MAP * MAP]; int[] q = new int[MAP * MAP]; int qn = 0;
             for (int i = 0; i < MAP; i++) for (int j = 0; j < MAP; j++)
-                if ((i == 0 || j == 0 || i == MAP - 1 || j == MAP - 1) && g[i * MAP + j] == 0) { seen[i * MAP + j] = 1; q[qn++] = i * MAP + j; }
+                if ((i == 0 || j == 0 || i == MAP - 1 || j == MAP - 1) && wide[i * MAP + j] == 0) { seen[i * MAP + j] = 1; q[qn++] = i * MAP + j; }
             while (qn > 0) {
                 int k = q[--qn], i = k / MAP, j = k % MAP;
                 int[][] nb = {{i + 1, j}, {i - 1, j}, {i, j + 1}, {i, j - 1}};
                 for (int[] uv : nb) {
                     int u = uv[0], v = uv[1]; if (u < 0 || v < 0 || u >= MAP || v >= MAP) continue; int n = u * MAP + v;
-                    if (seen[n] == 0 && g[n] == 0) { seen[n] = 1; q[qn++] = n; }
+                    if (seen[n] == 0 && wide[n] == 0) { seen[n] = 1; q[qn++] = n; }
                 }
             }
-            for (int k = 0; k < MAP * MAP; k++) if (g[k] == 0 && seen[k] == 0) g[k] = 1;
+            for (int i = 0; i < MAP; i++) for (int j = 0; j < MAP; j++) {
+                int k = i * MAP + j; if (g[k] != 0 || seen[k] != 0) continue;
+                boolean near = false;
+                for (int u = i - 1; u <= i + 1 && !near; u++) for (int v = j - 1; v <= j + 1; v++)
+                    if (u >= 0 && v >= 0 && u < MAP && v < MAP && seen[u * MAP + v] != 0) { near = true; break; }
+                if (!near) g[k] = 1;
+            }
         }
         return g;
     }
