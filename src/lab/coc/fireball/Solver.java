@@ -37,15 +37,38 @@ final class Solver {
         for (int i = 0; i < p.length; i += 2) RU.put(p[i], p[i + 1]);
     }
     static String ru(String n) { String r = RU.get(n); return r == null ? n : r; }
+    static final String CASTLE = "Clan Castle";
+
+    /** Types offered when the user fixes a building by hand: Clan Castle first, then the defences by Russian name. */
+    static List<String> editTypes() {
+        List<String> t = new ArrayList<>(DEFENSES); t.sort((a, b) -> ru(a).compareTo(ru(b))); t.add(0, CASTLE); return t;
+    }
 
     static final class Bld {
         final String name; final int w; double x, y; final double conf; final boolean def;
         final int u, s;  // footprint centre in the lattice frame of the scan (for tracking)
+        /** Set by the user (type chosen by hand): the survey never relabels it and it is not used to align frames. */
+        boolean manual;
+        /** Survey votes: type -> summed confidence over sightings, and the number of sightings. */
+        Map<String, Double> votes = new java.util.concurrent.ConcurrentHashMap<>(); int seen;
         Bld(String name, int w, double x, double y, double conf, int u, int s) {
             this.name = name; this.w = w; this.x = x; this.y = y; this.conf = conf; this.def = DEFENSES.contains(name); this.u = u; this.s = s;
+            votes.put(name, conf); seen = 1;
         }
         double cx() { return x + w / 2.0; }
         double cy() { return y + w / 2.0; }
+        boolean castle() { return CASTLE.equals(name); }
+        /** Uncertain type: low model confidence on one sighting, or sightings that disagree. */
+        boolean weak() {
+            if (manual) return false;
+            if (seen < 2) return conf < 0.6;
+            double all = 0; for (double v : votes.values()) all += v;
+            return votes.getOrDefault(name, 0.0) < 0.65 * all;
+        }
+        /** Copy moved by (dx, dy) or renamed; keeps votes and the manual mark. */
+        Bld copy(String newName, double dx, double dy) {
+            Bld b = new Bld(newName, w, x + dx, y + dy, conf, u, s); b.manual = manual; b.votes = new java.util.concurrent.ConcurrentHashMap<>(votes); b.seen = seen; return b;
+        }
     }
 
     static final class Zone { double[] centre; double margin; float[] pts; List<Bld> group; float[] edge; }

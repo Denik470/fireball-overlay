@@ -20,7 +20,7 @@ final class OverlayView extends View {
     private final DashPathEffect dash6, dash8, dash10;
     private final int[] loc = new int[2];
     private final Matrix m = new Matrix(); private final float[] mv = new float[9], pt = new float[2];
-    private final Path tmp = new Path();
+    private final Path tmp = new Path(), tmp2 = new Path();
     private OverlayService.Xf x; private OverlayService.Scene sc;
     private Geo geo;
 
@@ -50,7 +50,7 @@ final class OverlayView extends View {
         final Path[] area = {new Path(), new Path(), new Path(), new Path()};
         final List<Path> bind = new ArrayList<>(); final Path cleanX = new Path(), fb = new Path(), splash = new Path();
         final List<Path> zEdge = new ArrayList<>(), zCircle = new ArrayList<>(), zGroup = new ArrayList<>(); final List<Integer> zColor = new ArrayList<>();
-        Path eqEdge, eqCircle; final Path ok = new Path(), weak = new Path(), target = new Path();
+        Path eqEdge, eqCircle; final Path ok = new Path(), weak = new Path(), target = new Path(), castle = new Path(), via = new Path(), manual = new Path();
     }
 
     private static void quad(Path p, double X0, double Y0, double X1, double Y1) {
@@ -93,7 +93,12 @@ final class OverlayView extends View {
             }
             if (o.eq != null) { g.eqEdge = cells(o.eq.edge, 0.14); g.eqCircle = circle(o.eq.centre[0], o.eq.centre[1], o.eq.R); }
         }
-        for (Solver.Bld b : sc.B) if (b.def && b != T) foot(b.conf < 0.6 ? g.weak : g.ok, b);
+        for (Solver.Bld b : sc.B) {
+            if (b == T) continue;
+            if (b.castle()) foot(b == sc.via ? g.via : g.castle, b);
+            else if (b.def) foot(b.weak() ? g.weak : g.ok, b);
+            else if (b.manual) foot(g.manual, b);
+        }
         if (T != null) foot(g.target, T);
         return g;
     }
@@ -150,8 +155,24 @@ final class OverlayView extends View {
                 aim(c, o.eq.centre[0], o.eq.centre[1], 0xFFFFAA3C); label(c, o.eq.centre[0] + 1.1, o.eq.centre[1] + 1.1, "ТРЯС ±" + String.format("%.1f", o.eq.tol), 0xFFFFC27A);
             }
         }
-        if (full) { stroke(c, g.ok, pick ? 0xCCFFFFFF : 0x80FFFFFF, pick ? 1.5f : 1, null); stroke(c, g.weak, 0xFFFFD54A, pick ? 2 : 1.2f, null); }
-        if (pick) for (Solver.Bld b : sc.B) if (b.def) label(c, b.cx(), b.cy(), Solver.ru(b.name) + (b.conf < 0.6 ? " ?" : ""), b.conf < 0.6 ? 0xFFFFD54A : 0xFFFFFFFF);
-        if (T != null) { paint(c, g.target, 0x59FF2828); stroke(c, g.target, 0xFFFF3B3B, 3, null); label(c, T.cx(), T.cy(), Solver.ru(T.name), 0xFFFF6B6B); }
+        if (full) {
+            // Filled squares: a recognised building is told apart from the outline of its neighbours in dense parts of the base.
+            paint(c, g.ok, pick ? 0x40FFFFFF : 0x22FFFFFF); stroke(c, g.ok, pick ? 0xCCFFFFFF : 0x80FFFFFF, pick ? 1.5f : 1, null);
+            paint(c, g.weak, pick ? 0x50FFD54A : 0x28FFD54A); stroke(c, g.weak, 0xFFFFD54A, pick ? 2 : 1.2f, null);
+            paint(c, g.castle, pick ? 0x504FC3F7 : 0x204FC3F7); stroke(c, g.castle, 0xFF4FC3F7, pick ? 2 : 1.2f, null);
+            if (pick) { paint(c, g.manual, 0x30FFFFFF); stroke(c, g.manual, 0xAAFFFFFF, 1, dash6); }
+        }
+        if (sc.via != null) { paint(c, g.via, 0x504FC3F7); stroke(c, g.via, 0xFF4FC3F7, 3, null); }
+        boolean names = svc.names;
+        if (pick && names) for (Solver.Bld b : sc.B) if (b.def || b.castle()) {
+            boolean w = b.weak(); label(c, b.cx(), b.cy(), Solver.ru(b.name) + (w ? " ?" : ""), b.castle() ? 0xFF8FD8FF : w ? 0xFFFFD54A : 0xFFFFFFFF);
+        }
+        if (pick && svc.editing) {
+            Solver.Bld sel = svc.selected; double[] t = svc.selectedTile;
+            if (sel != null) { tmp2.reset(); foot(tmp2, sel); paint(c, tmp2, 0x6600E5FF); stroke(c, tmp2, 0xFF00E5FF, 3, null); }
+            else if (t != null) { tmp2.reset(); quad(tmp2, t[0], t[1], t[0] + 1, t[1] + 1); paint(c, tmp2, 0x6600E5FF); stroke(c, tmp2, 0xFF00E5FF, 3, null); }
+        }
+        if (T != null) { paint(c, g.target, 0x59FF2828); stroke(c, g.target, 0xFFFF3B3B, 3, null); if (names) label(c, T.cx(), T.cy(), Solver.ru(T.name), 0xFFFF6B6B); }
+        if (sc.via != null && names) label(c, sc.via.cx(), sc.via.cy(), Solver.ru(sc.via.name), 0xFF8FD8FF);
     }
 }
