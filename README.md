@@ -7,6 +7,13 @@ Android overlay that plans a Warden fireball + invisibility/quake placements ove
 
 The APK is attached to releases, not committed.
 
+## 0.9 (QC-no2)
+
+- The overlay panel fits the screen, defaults to the top right, and exposes names and Super Balloon cleanup in the compact menu.
+- Choose a target in the centre area and confirm, or use auto selection. Manual editing accepts building types and levels.
+- Tracking can recover from multiple saved views after a pan or zoom. The Warden zone uses a single colour.
+- Fireball splash markers estimate damage against building HP and nearby Builder's Hut repairs. First-invisibility timing and live testing are pending.
+
 ## 0.8
 
 - Fireball level picker 1–27 with radius and damage from the 19.32.4 game tables (radius 4/5/6 tiles changes only at levels 9 and 24).

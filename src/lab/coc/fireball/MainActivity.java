@@ -8,7 +8,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
-import android.view.Gravity;
+import android.widget.SeekBar;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.CheckBox;
@@ -35,21 +35,18 @@ public final class MainActivity extends Activity {
         LinearLayout col = new LinearLayout(this); col.setOrientation(LinearLayout.VERTICAL); col.setPadding(pad, pad * 2, pad, pad);
         TextView title = new TextView(this); title.setText("Fireball overlay"); title.setTextSize(22); col.addView(title);
         TextView help = new TextView(this); help.setTextSize(14); help.setPadding(0, pad / 2, 0, pad);
-        help.setText("1. Нажми «Старт», разреши показ поверх других приложений и запись экрана.\n" +
-                "   В окне записи лучше выбрать «Одно приложение» → Clash of Clans: тогда оверлей не попадает в кадр.\n" +
-                "2. Открой базу противника и подожди, пока она прогрузится. Нажми «Скан», затем води камерой по базе, пока все защиты не получат рамку, и нажми «Готово».\n" +
-                "3. Тапни по защите (или замку клана) или нажми «Авто» — подберу цель, где файер заденет больше защит. Ошибки распознавания исправь в «Правке».\n" +
-                "4. План рисуется поверх игры и следует за камерой. Голубая зона — где ставить Хранителя, белые прицелы — инвизы, оранжевое — тряс и всплеск файера.\n" +
-                "Кнопка «?» на панели оверлея объясняет кнопки текущего шага.");
+        help.setText("Нажми «Старт» и разреши показ поверх игры и запись экрана. "
+                + "В записи выбери «Одно приложение» → Clash of Clans. "
+                + "Открой базу, нажми «Скан» и следуй подсказкам панели.");
         col.addView(help);
         col.addView(label("Огненный шар Хранителя (уровень снаряжения)"));
         col.addView(fbLevel());
         col.addView(label("Землетрясение"));
-        Spinner eq = spinner(new String[]{"не нужен", "ур.1 R3.5", "ур.2 R3.8", "ур.3 R4.1", "ур.4 R4.4", "ур.5+ R4.7"}, EQ, "eqR", 4.7f); col.addView(eq);
-        col.addView(label("Запас для Хранителя (насколько можно промахнуться точкой)"));
-        col.addView(spinner(new String[]{"0,3 клетки — рискованно", "0,5 клетки", "0,75 клетки", "1 клетка — надёжно"}, WM, "wmin", 0.5f));
+        col.addView(spinner(new String[]{"Выкл.", "1", "2", "3", "4", "5+"}, EQ, "eqR", 4.7f));
+        col.addView(label("Мин. запас для Хранителя, клетки"));
+        col.addView(spinner(new String[]{"0,3", "0,5", "0,75", "1"}, WM, "wmin", 0.5f));
         col.addView(label("Распознавание (ИИ), пока показан план"));
-        col.addView(intSpinner(new String[]{"всегда — точнее держит план", "только когда двигаю камеру", "никогда — экономит батарею"}, "ai", 0));
+        col.addView(intSpinner(new String[]{"всегда — точнее держит план", "только при движении экрана", "никогда — экономит батарею"}, "ai", 0));
         col.addView(check("Подписи зданий на оверлее", "names", true));
         col.addView(check("Подчистка с края супершарами (1–2 здания)", "cleanup", false));
         col.addView(check("Хранитель только снаружи базы (рекомендуется)", "outside", true));
@@ -76,20 +73,52 @@ public final class MainActivity extends Activity {
         return s;
     }
 
-    /** Equipment level 1..27; stores the level and its radius ("fbR", read by the planner). */
-    private Spinner fbLevel() {
-        String[] labels = new String[27];
-        for (int i = 0; i < 27; i++) labels[i] = "ур. " + (i + 1) + " — радиус " + (int) fbRadius(i + 1) + " кл., урон " + FB_DAMAGE[i];
-        Spinner s = new Spinner(this);
-        s.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
-        float r = prefs.getFloat("fbR", 6);
-        int def = r <= 4 ? 8 : r <= 5 ? 23 : 27;  // older versions stored only the radius: highest level with that radius
-        s.setSelection(prefs.getInt("fbLvl", def) - 1);
-        s.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
-            @Override public void onItemSelected(android.widget.AdapterView<?> p, android.view.View v, int i, long id) { prefs.edit().putInt("fbLvl", i + 1).putFloat("fbR", fbRadius(i + 1)).apply(); }
-            @Override public void onNothingSelected(android.widget.AdapterView<?> p) { }
+    private LinearLayout fbLevel() {
+        LinearLayout control = new LinearLayout(this);
+        control.setOrientation(LinearLayout.VERTICAL);
+        TextView value = new TextView(this);
+        control.addView(value);
+        SeekBar slider = new SeekBar(this);
+        slider.setContentDescription("Уровень огненного шара");
+        java.util.List<Integer> levels = new java.util.ArrayList<>();
+        int stored = fireballLevel(prefs);
+        int initial = 0;
+        for (int i = 1; i <= 27; i++) {
+            if (i == 1 || FB_DAMAGE[i - 1] != FB_DAMAGE[i - 2] || fbRadius(i) != fbRadius(i - 1)) levels.add(i);
+            if (i <= stored) initial = levels.size() - 1;
+        }
+        slider.setMax(levels.size() - 1);
+        slider.setProgress(initial);
+        value.setText(levelLabel(levels, initial));
+        slider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar bar, int position, boolean fromUser) {
+                int level = levels.get(position);
+                value.setText(levelLabel(levels, position));
+                if (fromUser) prefs.edit().putInt("fbLvl", level).putFloat("fbR", fbRadius(level)).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar bar) { }
+            @Override public void onStopTrackingTouch(SeekBar bar) { }
         });
-        return s;
+        control.addView(slider);
+        return control;
+    }
+
+    static int fireballLevel(SharedPreferences prefs) {
+        float radius = prefs.getFloat("fbR", 6);
+        int fallback = radius <= 4 ? 8 : radius <= 5 ? 23 : 27;
+        return Math.max(1, Math.min(27, prefs.getInt("fbLvl", fallback)));
+    }
+
+    static int quakeLevel(SharedPreferences prefs) {
+        float radius = prefs.getFloat("eqR", 4.7f);
+        for (int i = 0; i < EQ.length; i++) if (Math.abs(EQ[i] - radius) < 1e-3) return i;
+        return 5;
+    }
+
+    private static String levelLabel(java.util.List<Integer> levels, int position) {
+        int first = levels.get(position);
+        int last = position + 1 == levels.size() ? 27 : levels.get(position + 1) - 1;
+        return first == last ? String.valueOf(first) : first + "–" + last;
     }
 
     private Spinner intSpinner(String[] labels, String key, int def) {

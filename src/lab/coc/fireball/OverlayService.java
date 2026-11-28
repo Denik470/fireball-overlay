@@ -218,11 +218,11 @@ public final class OverlayService extends Service {
     private void scan() {
         if (detector == null || mode == Mode.BUSY) return;
         trackGen++; setPick(false);  // "Скан новый" from the pick step: the overlay must let touches through again
-        mode = Mode.BUSY; editing = false; selected = null; selectedTile = null; setStatus("Сканирую… не двигай камеру"); refreshButtons();
+        mode = Mode.BUSY; editing = false; selected = null; selectedTile = null; setStatus("Сканирую… обычно около 10 с. Оставь экран на месте."); refreshButtons();
         overlay.setVisibility(View.INVISIBLE); bubble.setVisibility(View.INVISIBLE);
         final long hidden = android.os.SystemClock.uptimeMillis();
         work.postDelayed(() -> {
-            String err = null; Scene sc = null; Xf x = null; long t0 = System.currentTimeMillis();
+            String err = null; Scene sc = null; Xf x = null;
             try {
                 ensureSize();
                 float[] g = new float[Tracker.N];
@@ -232,22 +232,24 @@ public final class OverlayService extends Service {
                 double[] used = new double[1];
                 List<Detector.Det> d = detector.detect(img, -1, used); img.recycle();
                 if (d.size() < 8) throw new Exception("почти ничего не найдено (" + d.size() + "). Открой базу целиком");
-                Detector.Lattice L = detector.fit(d); scale = used[0]; scanA = L.a;
+                Detector.Lattice L = detector.fit(d);
+                if (L == null) throw new Exception("не удалось привязаться к базе");
+                scale = used[0]; scanA = L.a;
                 sc = buildScene(d, L); x = new Xf(); x.a = L.a; x.b = L.b; x.cx = L.cx; x.cy = L.cy; x.capW = capW; x.capH = capH; x.time = System.currentTimeMillis();
                 buildIndex(sc);
             } catch (Throwable e) { err = e.getMessage() == null ? e.toString() : e.getMessage(); }
-            final String fe = err; final Scene fs = sc; final Xf fx = x; final long ms = System.currentTimeMillis() - t0;
+            final String fe = err; final Scene fs = sc; final Xf fx = x;
             ui.post(() -> {
                 overlay.setVisibility(View.VISIBLE); bubble.setVisibility(View.VISIBLE);
                 if (fe != null) { mode = Mode.IDLE; setStatus("Ошибка: " + fe); refreshButtons(); return; }
-                scene = fs; xf = fx; ref = null; seen.clear(); mode = Mode.SURVEY;
-                setStatus(surveyText(fs) + " (" + ms + " мс).\n" + SURVEY_HINT); refreshButtons(); overlay.invalidate();
+                scene = fs; xf = fx; trackingOk = true; lastFix = fx.time; ref = null; anchors.clear(); alignMiss = 0; seen.clear(); mode = Mode.SURVEY;
+                setStatus(SURVEY_HINT); refreshButtons(); overlay.invalidate();
                 startTracking();
             });
         }, 60);
     }
 
-    static final String SURVEY_HINT = "Подожди, пока база прогрузится, затем води камерой по базе, пока все защиты не получат рамку. Потом «Готово»";
+    static final String SURVEY_HINT = "Подвигай экран, чтобы досканировать базу. Затем нажми «Готово».";
 
     /** "Скан +": keep every building found so far and survey again; new buildings are only added. */
     private void improve() {
@@ -255,7 +257,7 @@ public final class OverlayService extends Service {
         if (detector == null || c == null || c.B.isEmpty() || xf == null || ref == null) { scan(); return; }
         trackGen++; setPick(false); editing = false; selected = null; selectedTile = null;
         Scene ns = c.with(c.B); buildIndex(ns); scene = ns; seen.clear(); mode = Mode.SURVEY;
-        setStatus(surveyText(ns) + "\nДобавляю к прежнему скану: веди камеру по пропущенным местам, затем «Готово»"); refreshButtons(); overlay.invalidate();
+        setStatus("Подвигай экран по пропущенным местам, затем нажми «Готово»."); refreshButtons(); overlay.invalidate();
         startTracking();
     }
 
@@ -286,23 +288,61 @@ public final class OverlayService extends Service {
 
     private void buildIndex(Scene sc) {
         Map<String, Set<Long>> idx = new HashMap<>(); Map<String, Integer> cnt = new HashMap<>();
-        for (Solver.Bld b : sc.B) { if (b.manual) continue; idx.computeIfAbsent(b.name, k -> new HashSet<>()).add(key(b.u, b.s)); cnt.merge(b.name, 1, Integer::sum); }
+        for (Solver.Bld b : sc.B) { if (b.manual || b.name.equals("Wall")) continue; idx.computeIfAbsent(b.name, k -> new HashSet<>()).add(key(b.u, b.s)); cnt.merge(b.name, 1, Integer::sum); }
         index = idx; counts = cnt;
     }
     private static long key(int u, int s) { return ((long) u << 32) | (s & 0xffffffffL); }
 
+    static final String PICK_HINT = "Подведи цель к центру экрана и нажми «Область» или выбери «Авто».";
+    volatile Solver.Bld pendingTarget;
+    private boolean choosingArea;
+
     void pickAt(float vx, float vy) {
-        Scene sc = scene; Xf x = xf; if (sc == null || x == null || mode != Mode.PICK) return;
-        double[] g = overlay.toGrid(vx, vy, x, sc);
-        if (editing) { selectAt(sc, g); return; }
-        Solver.Bld best = null; double bd = 1e9;
+        Scene sc = scene; Xf x = xf;
+        if (mode == Mode.PICK && editing && x != null && trackingOk) selectAt(sc, overlay.toGrid(vx, vy, x, sc));
+    }
+
+    boolean showArea() {
+        return mode == Mode.PICK && choosingArea;
+    }
+
+    private List<Solver.Bld> areaCandidates(Scene sc, Xf x) {
+        List<Solver.Bld> candidates = new ArrayList<>();
+        if (x == null || !trackingOk) return candidates;
+        double[] g = overlay.toGrid(overlay.getWidth() / 2f, overlay.getHeight() / 2f, x, sc);
         for (Solver.Bld b : sc.B) {
-            if (!b.def && !b.castle()) continue;
-            boolean inside = g[0] >= b.x && g[0] <= b.x + b.w && g[1] >= b.y && g[1] <= b.y + b.w;
-            double d = Math.hypot(g[0] - b.cx(), g[1] - b.cy()) - (inside ? 100 : 0);
-            if (d < bd) { bd = d; best = b; }
+            if ((b.def || b.castle()) && Solver.distToFoot(g[0], g[1], b) <= 3) candidates.add(b);
         }
-        if (best == null) return;
+        candidates.sort((a, b) -> Double.compare(Math.hypot(g[0] - a.cx(), g[1] - a.cy()), Math.hypot(g[0] - b.cx(), g[1] - b.cy())));
+        return candidates;
+    }
+
+    private void nextAreaTarget() {
+        choosingArea = true;
+        editing = false;
+        hideEditList();
+        setPick(false);
+        List<Solver.Bld> candidates = areaCandidates(scene, xf);
+        int previous = candidates.indexOf(pendingTarget);
+        pendingTarget = candidates.isEmpty() ? null : candidates.get((previous + 1) % candidates.size());
+        setStatus(pendingTarget == null ? "Подведи цель к прицелу и снова нажми «Область»."
+                : Solver.ru(pendingTarget.name) + " · «Подтвердить» или «Область» для следующей цели.");
+        refreshButtons();
+        overlay.invalidate();
+    }
+
+    private void confirmTarget() {
+        Scene sc = scene;
+        Solver.Bld best = pendingTarget;
+        if (best == null || !areaCandidates(sc, xf).contains(best)) {
+            pendingTarget = null;
+            setStatus(PICK_HINT);
+            refreshButtons();
+            overlay.invalidate();
+            return;
+        }
+        pendingTarget = null;
+        choosingArea = false;
         if (best.castle()) { planVia(sc, best); return; }
         final Solver.Bld T = best; mode = Mode.BUSY; setPick(false);
         setStatus("Считаю план для цели «" + Solver.ru(T.name) + "»…"); refreshButtons();
@@ -323,10 +363,10 @@ public final class OverlayService extends Service {
         float fbR = prefs.getFloat("fbR", 6);
         List<Solver.Bld> cand = new ArrayList<>();
         for (Solver.Bld b : sc.B) if (b.def && Solver.distToFoot(b.cx(), b.cy(), cc) <= fbR) cand.add(b);
-        if (cand.isEmpty()) { setStatus("Рядом с замком нет защиты, чей файер его заденет. Выбери другую цель"); return; }
-        mode = Mode.BUSY; setPick(false); setStatus("Замок клана: ищу защиту, через которую файер его заденет…"); refreshButtons();
+        if (cand.isEmpty()) { setStatus("Рядом с замком нет защиты, чей фаер его заденет. Выбери другую цель"); return; }
+        mode = Mode.BUSY; setPick(false); setStatus("Замок клана: ищу защиту, через которую фаер его заденет…"); refreshButtons();
         bestTarget(sc, cand, "Замок: пробую", (T, R) -> {
-            if (T == null) { mode = Mode.PICK; setPick(true); setStatus("Через защиты рядом с замком надёжного броска нет. Уменьши запас или выбери цель вручную"); refreshButtons(); return; }
+            if (T == null) { mode = Mode.PICK; setPick(false); startTracking(); setStatus("Через защиты рядом с замком надёжного броска нет. Уменьши запас или выбери цель вручную"); refreshButtons(); return; }
             showPlan(sc, T, R, cc);
         });
     }
@@ -341,21 +381,23 @@ public final class OverlayService extends Service {
     }
 
     /** Applies the type picked in the panel: null = delete; a new building is centred on the tapped tile. */
-    private void applyEdit(String type) {
+    private void applyEdit(String type, int level) {
         Scene sc = scene; Solver.Bld sel = selected; double[] tile = selectedTile;
         List<Solver.Bld> nb = new ArrayList<>(sc.B);
         if (sel != null) {
             nb.remove(sel);
             if (type != null) {
                 int w = sizes.containsKey(type) ? sizes.get(type) : sel.w;
-                nb.add(manualBld(sc, type, w, sel.cx(), sel.cy()));
+                Solver.Bld b = manualBld(sc, type, w, sel.cx(), sel.cy());
+                b.setLevel(level); nb.add(b);
             }
         } else if (tile != null && type != null) {
             int w = sizes.containsKey(type) ? sizes.get(type) : 3;
-            nb.add(manualBld(sc, type, w, tile[0] + 0.5, tile[1] + 0.5));
+            Solver.Bld b = manualBld(sc, type, w, tile[0] + 0.5, tile[1] + 0.5);
+            b.setLevel(level); nb.add(b);
         }
         Scene ns = sc.with(nb); buildIndex(ns); scene = ns; selected = null; selectedTile = null;
-        hideEditList(); setStatus(surveyText(ns) + ". Тапни следующее здание для правки или выключи «Правка»"); refreshButtons(); overlay.invalidate();
+        hideEditList(); setStatus("Коснись здания для правки или выключи «Правка»."); refreshButtons(); overlay.invalidate();
     }
 
     /** Building placed by hand, footprint snapped to whole tiles around (cx, cy). */
@@ -370,15 +412,12 @@ public final class OverlayService extends Service {
         Scene sc = scene; Solver.Plan p = sc.plan();
         if (p == null) { setStatus(Solver.ru(sc.target.name) + ": " + (sc.res.error != null ? sc.res.error : "решения нет")); return; }
         StringBuilder t = new StringBuilder();
-        if (sc.via != null) t.append("Замок клана — файер в «").append(Solver.ru(sc.target.name)).append("», всплеск заденет замок\n");
+        if (sc.via != null) t.append("Замок клана — фаер в «").append(Solver.ru(sc.target.name)).append("», всплеск заденет замок\n");
         t.append("Вар ").append(sc.opt + 1).append('/').append(sc.res.options.size()).append(": ")
          .append(p.k == 0 ? "без инвизов" : p.k + " инвиз" + (p.k < 5 ? "а" : "ов"))
-         .append(" · дед ±").append(String.format("%.1f", p.wardenTol));
+         .append(" · запас ≈ ").append(String.format("%.1f", p.wardenTol));
         if (p.eq != null) t.append(" · тряс ±").append(String.format("%.1f", p.eq.tol));
         if (!p.C.isEmpty()) t.append(" · шары: ").append(p.C.size());
-        int sd = 0; for (Solver.Bld b : p.splash) if (b.def && b != sc.target) sd++;
-        t.append(" · во всплеске защит: ").append(sd);
-        t.append(" · ").append(sc.res.ms).append(" мс");
         for (int i = 0; i < p.zones.size(); i++) {
             t.append("\nИнвиз ").append(i + 1).append(": ");
             List<Solver.Bld> g = p.zones.get(i).group;
@@ -393,16 +432,14 @@ public final class OverlayService extends Service {
     /** Sightings of not-yet-known buildings, key name@u,s (scan lattice frame); added after 2 sightings. */
     private final Map<String, int[]> seen = new HashMap<>();
 
-    private static String surveyText(Scene sc) {
-        int nd = 0; for (Solver.Bld b : sc.B) if (b.def) nd++;
-        return "Зданий: " + sc.B.size() + ", защит: " + nd;
-    }
-
     private void survey(List<Detector.Det> d, Detector.Lattice L, Xf x) {
         Scene sc = scene; List<Solver.Bld> add = new ArrayList<>(); Map<Solver.Bld, String> relabel = new HashMap<>();
+        Set<Long> observed = new HashSet<>();
         for (int j = 0; j < d.size(); j++) {
             Detector.Det e = d.get(j); int u = L.u[j] + x.du, s = L.s[j] + x.ds;
-            if (e.name.startsWith("Hero ")) continue;
+            if (e.name.startsWith("Hero ") || !observed.add(key(u, s))) continue;
+            double gx = (u + s) / 2.0 + sc.ox, gy = (s - u) / 2.0 + sc.oy;
+            if (gx < -4 || gy < -4 || gx > Solver.MAP + 4 || gy > Solver.MAP + 4) continue;
             double bx = (u + s) / 2.0 - e.w / 2.0 + sc.ox, by = (s - u) / 2.0 - e.w / 2.0 + sc.oy;
             Solver.Bld known = same(sc.B, bx, by, e.w);
             if (known != null) {
@@ -424,7 +461,7 @@ public final class OverlayService extends Service {
         for (Solver.Bld b : sc.B) { String r = relabel.get(b); nb.add(r == null ? b : b.copy(r, 0, 0)); }
         nb.addAll(add);
         Scene ns = sc.with(nb); buildIndex(ns); scene = ns;
-        ui.post(() -> { if (mode == Mode.SURVEY) { setStatus(surveyText(ns) + "\nВеди камеру дальше или жми «Готово»"); overlay.invalidate(); } });
+        ui.post(() -> { if (mode == Mode.SURVEY) { setStatus(SURVEY_HINT); overlay.invalidate(); } });
     }
 
     /** Known building of the same size at (almost) the same footprint. */
@@ -450,8 +487,8 @@ public final class OverlayService extends Service {
         List<Solver.Bld> nb = new ArrayList<>();
         for (Solver.Bld b : sc.B) nb.add(b.copy(b.name, dx, dy));
         Scene ns = new Scene(); ns.B = nb; ns.ox = sc.ox + dx; ns.oy = sc.oy + dy; buildIndex(ns); scene = ns;
-        mode = Mode.PICK; setPick(true);
-        setStatus(surveyText(ns) + ". Тапни по защите или замку — это цель. «Авто» — подберу лучшую. «Правка» — исправить здание"); refreshButtons(); overlay.invalidate();
+        mode = Mode.PICK; setPick(false); startTracking();
+        setStatus(PICK_HINT); refreshButtons(); overlay.invalidate();
     }
 
     // ---------------- auto target ----------------
@@ -464,10 +501,10 @@ public final class OverlayService extends Service {
 
     private void autoTarget() {
         Scene sc = scene; if (sc == null || mode != Mode.PICK) return;
-        mode = Mode.BUSY; setPick(false); editing = false; hideEditList(); setStatus("Подбираю цель…"); refreshButtons();
+        mode = Mode.BUSY; setPick(false); editing = false; hideEditList(); setStatus("Подбираю цель… может занять больше 10 с."); refreshButtons();
         List<Solver.Bld> cand = new ArrayList<>(); for (Solver.Bld b : sc.B) if (b.def) cand.add(b);
-        bestTarget(sc, cand, "Подбираю цель…", (T, R) -> {
-            if (T == null) { mode = Mode.PICK; setPick(true); setStatus("Надёжного броска не нашёл. Уменьши запас или выбери цель вручную"); refreshButtons(); return; }
+        bestTarget(sc, cand, "Подбираю цель… может занять больше 10 с.", (T, R) -> {
+            if (T == null) { mode = Mode.PICK; setPick(false); startTracking(); setStatus("Надёжного броска не нашёл. Уменьши запас или выбери цель вручную"); refreshButtons(); return; }
             showPlan(sc, T, R, null);
         });
     }
@@ -505,16 +542,21 @@ public final class OverlayService extends Service {
     // Two loops: "fb-track" follows the camera every frame by phase correlation against a reference frame with a known
     // transform (~10-30 ms); "fb-work" keeps re-detecting with YOLO and, on a good match, makes that frame the new reference
     // (removes drift and fixes zoom). Large moves re-base the reference on the current frame.
-    private static final double[] SCALES = {0.97, 1, 1.03}, WIDE = {0.8, 0.88, 0.95, 1, 1.05, 1.13, 1.25};
+    private static final double[] SCALES = {0.97, 1, 1.03}, WIDE = {0.66, 0.75, 0.82, 0.90, 1, 1.10, 1.21, 1.33, 1.50};
     private volatile int trackGen;
+    private final java.util.concurrent.CopyOnWriteArrayList<Tracker.Ref> anchors = new java.util.concurrent.CopyOnWriteArrayList<>();
+    private void rememberAnchor(Tracker.Ref anchor) {
+        anchors.add(anchor);
+        if (anchors.size() > 4) anchors.remove(1); // keep the first view and the three latest anchors
+    }
     private void startTracking() {
         final int gen = ++trackGen;
         Xf x0 = xf; float[] g0 = scanGrey;
-        if (ref == null && x0 != null && g0 != null) ref = Tracker.makeRef(g0, x0);
+        if (ref == null && x0 != null && g0 != null) { ref = Tracker.makeRef(g0, x0); rememberAnchor(ref); }
         track.post(new Runnable() {
-            long last = 0; final float[] g = new float[Tracker.N];
+            long last = 0; int recoveryCursor; final float[] g = new float[Tracker.N];
             @Override public void run() {
-                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY)) return;
+                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY && mode != Mode.PICK)) return;
                 long ts = grey(last + 1, g);
                 Tracker.Ref r = ref;
                 if (ts < 0 || r == null) { track.postDelayed(this, 6); return; }
@@ -524,6 +566,17 @@ public final class OverlayService extends Service {
                     if (base.capW != capW || base.capH != capH) { ref = null; track.postDelayed(this, 50); return; }
                     Tracker.Est e = tracker.match(r, g, r.sc, SCALES);
                     if (e.peak < 0.12) e = tracker.match(r, g, r.sc, WIDE);  // fast pinch zoom: search a wider scale range
+                    if (e.peak < 0.12 && System.currentTimeMillis() - lastFix > 300 && !anchors.isEmpty()) {
+                        Tracker.Ref[] snapshot = anchors.toArray(new Tracker.Ref[0]);
+                        if (snapshot.length == 0) return;
+                        Tracker.Ref anchor = snapshot[recoveryCursor++ % snapshot.length];
+                        Xf ax = (Xf) anchor.xf;
+                        if (anchor != r && ax.capW == capW && ax.capH == capH) {
+                            Tracker.Est recovered = tracker.match(anchor, g, 1, WIDE);
+                            if (recovered.peak >= 0.17) { r = anchor; base = ax; e = recovered; ref = anchor; }
+                        }
+                    }
+                    if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY && mode != Mode.PICK)) return;
                     if (e.peak >= 0.12) {
                         Xf prev = xf;
                         r.sc = e.sc; Xf x = derive(base, e); xf = x; lastFix = System.currentTimeMillis();
@@ -539,7 +592,7 @@ public final class OverlayService extends Service {
         work.post(new Runnable() {
             long last = 0; final float[] g = new float[Tracker.N];
             @Override public void run() {
-                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY)) return;
+                if (gen != trackGen || (mode != Mode.PLAN && mode != Mode.SURVEY && mode != Mode.PICK)) return;
                 // Recognition setting (survey always recognises): never, or only while the camera moved in the last 1.5 s.
                 if (mode == Mode.PLAN && (aiMode == 2 || (aiMode == 1 && System.currentTimeMillis() - lastMove > 1500))) { work.postDelayed(this, 200); return; }
                 try {
@@ -553,15 +606,21 @@ public final class OverlayService extends Service {
                     double[] used = new double[1];
                     List<Detector.Det> d = detector.detect(img, k, used); img.recycle();
                     Xf x = null; Detector.Lattice L = null;
-                    if (d.size() >= 6) { L = detector.fit(d); x = align(d, L); }
+                    if (d.size() >= 6) { L = detector.fit(d); if (L != null) x = align(d, L); }
                     alignMiss = x == null ? alignMiss + 1 : 0;
-                    if (probe && x != null) { scale = used[0]; scanA = L.a; }
+                    if (gen != trackGen) return;
+                    if (x != null) { scale = used[0]; scanA = L.a; }
+                    else wardenHits = 0;
                     if (x != null) {
                         if (x != null && gen == trackGen && mode == Mode.SURVEY) survey(d, L, x);
                         if (x != null && gen == trackGen && mode == Mode.PLAN && !autoHidden) wardenCheck(d, L, x);
                         if (x != null && gen == trackGen) {
                             Tracker.Ref nr = Tracker.makeRef(g.clone(), x); Xf now = xf;
-                            if (now != null) nr.sc = now.a / x.a;  // camera zoom since that frame: prior for the tracker
+                            if (now != null && trackingOk) nr.sc = Math.max(0.85, Math.min(1.15, now.a / x.a));  // camera zoom since that frame: prior for the tracker
+                            Xf anchor = anchors.isEmpty() ? null : (Xf) anchors.get(anchors.size() - 1).xf;
+                            if (anchor == null || Math.abs(anchor.a / x.a - 1) > 0.12
+                                    || Math.abs((anchor.cx - anchor.a * anchor.du) - (x.cx - x.a * x.du)) > x.capW * 0.22
+                                    || Math.abs((anchor.cy - anchor.b * anchor.ds) - (x.cy - x.b * x.ds)) > x.capH * 0.22) rememberAnchor(nr);
                             ref = nr;
                         }
                     }
@@ -572,18 +631,19 @@ public final class OverlayService extends Service {
     }
 
     // ---------------- hide the plan once the Warden is down ----------------
-    volatile boolean autoHidden; private int wardenHits;
-    /** A Grand Warden seen near the planned spot on 2 YOLO frames = deployed: hide the plan and collapse the panel. */
+    volatile boolean autoHidden; private int wardenHits; private volatile boolean wardenArmed;
+    /** Arm on a frame without a Warden, then require three matching frames near the deployment point. */
     private void wardenCheck(List<Detector.Det> d, Detector.Lattice L, Xf x) {
         Scene sc = scene; Solver.Plan p = sc.plan(); if (p == null || !prefs.getBoolean("hideOnDeploy", true)) return;
         boolean near = false;
         for (int j = 0; j < d.size(); j++) {
             if (!d.get(j).name.equals("Hero Grand Warden")) continue;
             int u = L.u[j] + x.du, s = L.s[j] + x.ds; double X = (u + s) / 2.0 + sc.ox, Y = (s - u) / 2.0 + sc.oy;
-            if (Math.hypot(X - p.wardenPt[0], Y - p.wardenPt[1]) < 6) near = true;
+            if (d.get(j).conf >= 0.6 && Math.hypot(X - p.wardenPt[0], Y - p.wardenPt[1]) < 3) near = true;
         }
-        wardenHits = near ? wardenHits + 1 : 0;
-        if (wardenHits >= 2) {
+        if (!near) { wardenArmed = true; wardenHits = 0; return; }
+        if (wardenArmed) wardenHits++;
+        if (wardenHits >= 3) {
             wardenHits = 0; autoHidden = true;
             ui.post(() -> { setCollapsed(true); setStatus("Хранитель высажен — план скрыт. Тап по 🔥 — вернуть"); overlay.invalidate(); });
         }
@@ -613,12 +673,24 @@ public final class OverlayService extends Service {
                 votes.merge(key(du, ds), w, Double::sum);
             }
         }
-        long bestK = 0; double top = -1;
-        for (Map.Entry<Long, Double> e : votes.entrySet()) if (e.getValue() > top) { top = e.getValue(); bestK = e.getKey(); }
-        if (top < 0) return null;
-        int du = (int) (bestK >> 32), ds = (int) bestK, hit = 0;
-        for (int j = 0; j < d.size(); j++) { Set<Long> same = idx.get(d.get(j).name); if (same != null && same.contains(key(L.u[j] + du, L.s[j] + ds))) hit++; }
-        if (hit < Math.max(6, 0.3 * d.size())) return null;
+        long bestK = 0;
+        double top = 0, second = 0;
+        for (Map.Entry<Long, Double> e : votes.entrySet()) {
+            double weight = e.getValue();
+            if (weight > top) { second = top; top = weight; bestK = e.getKey(); }
+            else second = Math.max(second, weight);
+        }
+        if (top <= second + 0.1) return null;
+        int du = (int) (bestK >> 32), ds = (int) bestK;
+        Set<Long> hits = new HashSet<>();
+        for (int j = 0; j < d.size(); j++) {
+            Set<Long> same = idx.get(d.get(j).name);
+            long coord = key(L.u[j] + du, L.s[j] + ds);
+            if (same != null && same.contains(coord)) hits.add(coord);
+        }
+        int eligible = 0;
+        for (Detector.Det det : d) if (idx.containsKey(det.name)) eligible++;
+        if (hits.size() < Math.max(6, 0.3 * eligible)) return null;
         Xf x = new Xf(); x.a = L.a; x.b = L.b; x.cx = L.cx; x.cy = L.cy; x.du = du; x.ds = ds; x.capW = capW; x.capH = capH; x.time = System.currentTimeMillis();
         return x;
     }
@@ -628,7 +700,8 @@ public final class OverlayService extends Service {
     // It collapses by itself once a plan is ready. "Вид" cycles the drawing: full plan / marks only / hidden.
     volatile int view;  // 0 full, 1 marks only, 2 hidden
     private boolean collapsed; private Mode shownMode = Mode.IDLE;
-    private LinearLayout panel; private TextView mini; private GradientDrawable miniBg; private boolean statusOpen;
+    private LinearLayout panel; private TextView mini, statusToggle;
+    private boolean rightEdge; private GradientDrawable miniBg; private boolean statusOpen;
     private float dp() { return getResources().getDisplayMetrics().density; }
 
     private void addWindows() {
@@ -651,19 +724,32 @@ public final class OverlayService extends Service {
         buttons = new LinearLayout(this); buttons.setOrientation(LinearLayout.VERTICAL);
         editList = new LinearLayout(this); editList.setOrientation(LinearLayout.VERTICAL);
         editScroll = new android.widget.ScrollView(this); editScroll.addView(editList); editScroll.setVisibility(View.GONE);
-        editScroll.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, (int) (190 * dp)));
+        editScroll.setLayoutParams(new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, (int) (132 * dp)));
         status = new TextView(this); status.setTextColor(0xFFDDE3EA); status.setTextSize(11); status.setMaxWidth((int) (320 * dp));
         status.setPadding((int) (4 * dp), 0, (int) (4 * dp), (int) (2 * dp)); status.setMaxLines(2); status.setEllipsize(android.text.TextUtils.TruncateAt.END);
-        status.setOnClickListener(v -> { statusOpen = !statusOpen; status.setMaxLines(statusOpen || helpOpen ? 30 : 2); });
-        panel.addView(buttons); panel.addView(editScroll); panel.addView(status);
+        statusToggle = button("⌄", 0xFF37474F, v -> {
+            statusOpen = !statusOpen;
+            updateStatusLines();
+        });
+        panel.addView(buttons); panel.addView(status); panel.addView(statusToggle); panel.addView(editScroll);
+        statusToggle.setContentDescription("Развернуть текст");
+        bubble.addOnLayoutChangeListener((v, l, t, r, b, oldL, oldT, oldR, oldB) -> {
+            if (r - l != oldR - oldL || b - t != oldB - oldT) fitPanel();
+        });
         mini = new TextView(this); mini.setText("🔥"); mini.setTextSize(18); mini.setGravity(Gravity.CENTER);
         miniBg = new GradientDrawable(); miniBg.setShape(GradientDrawable.OVAL); miniBg.setColor(0xB0141820); miniBg.setStroke((int) (3 * dp), 0xFF777777);
         mini.setBackground(miniBg); int sz = (int) (44 * dp); mini.setLayoutParams(new LinearLayout.LayoutParams(sz, sz));
-        bubble.addView(panel); bubble.addView(mini);
+        LinearLayout miniBar = new LinearLayout(this);
+        miniBar.addView(mini);
+        miniBar.addView(button("⋯", 0xFF37474F, v -> showActions(v, true)));
+        miniBar.setVisibility(View.GONE);
+        bubble.addView(panel); bubble.addView(miniBar);
         bubbleLp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS, PixelFormat.TRANSLUCENT);
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT);
         bubbleLp.gravity = Gravity.TOP | Gravity.LEFT;
-        bubbleLp.x = prefs.getInt("bx", (int) (8 * dp)); bubbleLp.y = prefs.getInt("by", (int) (60 * dp));
+        rightEdge = prefs.getBoolean("rightEdge", prefs.getInt("bx", screenSize()[0]) > screenSize()[0] / 2);
+        bubbleLp.x = rightEdge ? Math.max(0, screenSize()[0] - (int) (330 * dp)) : 0;
+        bubbleLp.y = prefs.getInt("by", (int) (8 * dp));
         if (Build.VERSION.SDK_INT >= 28) bubbleLp.layoutInDisplayCutoutMode = Build.VERSION.SDK_INT >= 30 ? 3 : 1;
         wm.addView(bubble, bubbleLp);
         mini.setOnTouchListener(dragger(true));
@@ -695,17 +781,28 @@ public final class OverlayService extends Service {
     }
 
     private void snap() {
-        int w = screenSize()[0], bw = bubble.getWidth();
-        bubbleLp.x = bubbleLp.x + bw / 2 < w / 2 ? (int) (4 * dp()) : Math.max(0, w - bw - (int) (4 * dp()));
-        bubbleLp.y = Math.max(0, bubbleLp.y);
-        wm.updateViewLayout(bubble, bubbleLp);
-        prefs.edit().putInt("bx", bubbleLp.x).putInt("by", bubbleLp.y).apply();
+        rightEdge = bubbleLp.x + bubble.getWidth() / 2 >= screenSize()[0] / 2;
+        fitPanel();
+        prefs.edit().putBoolean("rightEdge", rightEdge).putInt("by", bubbleLp.y).apply();
+    }
+
+    private void fitPanel() {
+        int[] size = screenSize();
+        int pad = (int) (4 * dp());
+        int x = Math.max(0, rightEdge ? size[0] - bubble.getWidth() - pad : pad);
+        int y = Math.max(0, Math.min(bubbleLp.y, size[1] - bubble.getHeight() - pad));
+        if (x == bubbleLp.x && y == bubbleLp.y) return;
+        bubbleLp.x = x;
+        bubbleLp.y = y;
+        if (bubble.isAttachedToWindow()) wm.updateViewLayout(bubble, bubbleLp);
     }
 
     private void setCollapsed(boolean c) {
         if (!c) unhide();
-        collapsed = c; panel.setVisibility(c ? View.GONE : View.VISIBLE); mini.setVisibility(c ? View.VISIBLE : View.GONE);
-        bubble.post(this::snap);
+        if (collapsed == c) return;
+        collapsed = c;
+        panel.setVisibility(c ? View.GONE : View.VISIBLE);
+        ((View) mini.getParent()).setVisibility(c ? View.VISIBLE : View.GONE);
     }
 
     private void setPick(boolean on) {
@@ -714,10 +811,15 @@ public final class OverlayService extends Service {
         wm.updateViewLayout(overlay, overlayLp);
     }
 
+    volatile boolean trackingOk;
     private TextView lagDot;
     private void setLag(boolean ok) {
+        trackingOk = ok; overlay.invalidate();
         int c = ok ? 0xFF3DDC84 : 0xFFFF5A5A;
-        if (lagDot != null) lagDot.setTextColor(c);
+        if (lagDot != null) {
+            lagDot.setTextColor(c);
+            lagDot.setContentDescription(ok ? "База найдена" : "Восстанавливаю привязку");
+        }
         if (miniBg != null) miniBg.setStroke((int) (3 * dp()), mode == Mode.PLAN || mode == Mode.SURVEY ? c : 0xFF777777);
     }
 
@@ -742,26 +844,34 @@ public final class OverlayService extends Service {
 
     private static String help(Mode m) {
         switch (m) {
-            case SURVEY: return "Сейчас ИИ ищет здания на каждом кадре и добавляет новые. Подожди загрузки базы и води камерой, пока все защиты не получат рамку. "
+            case SURVEY: return "Сейчас ИИ ищет здания на каждом кадре и добавляет новые. Подожди загрузки базы и двигай экран, пока все защиты не получат рамку. "
                     + "Жёлтая рамка — тип под вопросом (исправишь в «Правке»). «Готово» — закончить сбор.";
-            case PICK: return "Тапни защиту или замок клана — это цель. Белая заливка — защита, жёлтая — тип под вопросом, синяя — замок клана "
-                    + "(файер в замок не летит: подберу защиту, чей всплеск его заденет).\n«Авто» — цель, где файер заденет больше защит.\n"
-                    + "«Правка» — тап по зданию: сменить тип или удалить; тап по пустому месту: добавить пропущенное.\n«Имена» — подписи вкл/выкл.\n"
+            case PICK: return "«Область» выделяет цель у прицела. Затем нажми «Подтвердить». Белая заливка — защита, жёлтая — тип под вопросом, синяя — замок клана "
+                    + "(фаер в замок не летит: подберу защиту, чей всплеск его заденет).\n«Авто» — цель, где фаер заденет больше защит.\n"
+                    + "«Правка» — тап по зданию: сменить тип или удалить; тап по пустому месту: добавить пропущенное.\n«Подписи зданий» — в меню ⋯.\n"
                     + "«Скан +» — досканировать, найденное сохраняется. «Скан новый» — всё заново.";
-            case PLAN: return "Голубая зона — куда ставить Хранителя (ярче — надёжнее), белые прицелы — инвизы, оранжевое — тряс и всплеск файера, "
-                    + "красный крест — снести шарами.\n«◀ ▶» — варианты плана.\n«Показ» — весь план / только прицелы / скрыт.\n"
-                    + "«ИИ» — распознавание во время плана: всегда / только пока двигаешь камеру / выкл. Выкл экономит батарею; план всё равно идёт за камерой, "
-                    + "но после сильного зума может съехать, и план не скроется сам после высадки Хранителя.\n«Цель» — другая цель. «Имена» — подписи вкл/выкл.\n"
-                    + "Точка: зелёная — план держится за базой, красная — потерял, подвигай камеру.";
+            case PLAN: return "Голубая зона — куда ставить Хранителя (допустимая точка), белые прицелы — инвизы, оранжевое — тряс и всплеск фаера, "
+                    + "красные платформы — мал запас урона, зелёные — урона должно хватить. Красный крест — снести шарами.\n«Вариант» — следующий план.\n«Показ» — весь план / только прицелы / скрыт.\n"
+                    + "«ИИ» — распознавание во время плана: всегда / только при движении экрана / выкл. Выкл экономит батарею; план всё равно следует за базой, "
+                    + "но после сильного зума может съехать, и план не скроется сам после высадки Хранителя.\n«Цель» — другая цель. «Подписи зданий» — в меню ⋯.\n"
+                    + "Точка: зелёная — план держится за базой, красная — потерял, подвигай экран.";
             default: return "«Скан» — снять базу с экрана: открой базу противника, дождись загрузки и нажми.\n"
                     + "«Свернуть» — спрятать панель в кнопку 🔥: тап — открыть, перетащить — переместить, долгое нажатие при готовом плане — сменить показ.\n"
-                    + "✕ — закрыть оверлей (нажать два раза).";
+                    + "«Закрыть» в меню ⋯ — нажать два раза.";
         }
     }
 
     private void toggleHelp() {
         helpOpen = !helpOpen;
-        status.setText(helpOpen ? help(mode) : statusText); status.setMaxLines(helpOpen || statusOpen ? 30 : 2); refreshButtons();
+        statusOpen = helpOpen;
+        status.setText(helpOpen ? help(mode) : statusText); updateStatusLines(); refreshButtons();
+    }
+
+    private void updateStatusLines() {
+        boolean expanded = statusOpen;
+        status.setMaxLines(expanded ? 10 : 2);
+        statusToggle.setText(expanded ? "⌃" : "⌄");
+        statusToggle.setContentDescription(expanded ? "Свернуть текст" : "Развернуть текст");
     }
 
     /** Type list for the selected building: its survey votes first (what the model also saw there), then same-size types, then the rest. */
@@ -776,35 +886,46 @@ public final class OverlayService extends Service {
             for (String t : types) if (!order.contains(t) && sizes.containsKey(t) && sizes.get(t) == sel.w) order.add(t);
         }
         for (String t : types) if (!order.contains(t)) order.add(t);
-        LinearLayout row = null; int i = 0;
-        List<TextView> all = new ArrayList<>();
-        if (sel != null) all.add(button("Удалить", 0xFF8E2424, v -> applyEdit(null)));
-        for (String t : order) all.add(button(Solver.ru(t), t.equals(Solver.CASTLE) ? 0xFF1565C0 : 0xFF37474F, v -> applyEdit(t)));
-        all.add(button("Отмена", 0xFF555555, v -> { selected = null; selectedTile = null; hideEditList(); overlay.invalidate(); }));
-        for (TextView b : all) {
-            if (i++ % 3 == 0) { row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); editList.addView(row); }
-            row.addView(b);
-        }
+        View divider = new View(this);
+        divider.setBackgroundColor(0x38FFFFFF);
+        editList.addView(divider, new LinearLayout.LayoutParams(-1, Math.max(1, (int) dp())));
+        List<String> labels = new ArrayList<>();
+        labels.add("— Не выбрано —");
+        for (String type : order) labels.add(Solver.ru(type));
+        android.widget.Spinner typesMenu = new android.widget.Spinner(this);
+        typesMenu.setAdapter(new android.widget.ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, labels));
+        editList.addView(typesMenu);
+        android.widget.Spinner levels = new android.widget.Spinner(this);
+        editList.addView(levels);
+        typesMenu.setOnItemSelectedListener(new android.widget.AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(android.widget.AdapterView<?> parent, View view, int position, long id) {
+                String type = position == 0 ? null : order.get(position - 1);
+                List<String> options = new ArrayList<>();
+                options.add("Уровень неизвестен");
+                int max = DamageEstimate.maxLevel(type);
+                for (int i = 1; i <= max; i++) options.add("Уровень " + i);
+                levels.setAdapter(new android.widget.ArrayAdapter<>(OverlayService.this, android.R.layout.simple_spinner_dropdown_item, options));
+                levels.setVisibility(max > 0 ? View.VISIBLE : View.GONE);
+                levels.setSelection(sel != null && sel.name.equals(type) ? sel.level : 0);
+            }
+            @Override public void onNothingSelected(android.widget.AdapterView<?> parent) { levels.setVisibility(View.GONE); }
+        });
+        int originalType = sel == null ? -1 : order.indexOf(sel.name);
+        typesMenu.setSelection(originalType + 1);
+        editList.addView(button("Применить", 0xFF1565C0, v -> {
+            int i = typesMenu.getSelectedItemPosition();
+            if (i > 0) applyEdit(order.get(i - 1), Math.max(0, levels.getSelectedItemPosition()));
+        }));
+        if (sel != null) editList.addView(button("Удалить", 0xFF8E2424, v -> applyEdit(null, 0)));
         editScroll.scrollTo(0, 0); editScroll.setVisibility(View.VISIBLE);
     }
     private void hideEditList() { if (editScroll != null) editScroll.setVisibility(View.GONE); }
 
-    private TextView closeButton() {
-        final TextView b = button("✕", 0xFF8E2424, null);
-        b.setOnClickListener(v -> {
-            long now = android.os.SystemClock.uptimeMillis();
-            if (now - closeArmed < 3000) { stopSelf(); return; }
-            closeArmed = now; b.setText("Закрыть? Ещё раз");
-            ui.postDelayed(() -> { if (android.os.SystemClock.uptimeMillis() - closeArmed >= 2900) b.setText("✕"); }, 3000);
-        });
-        return b;
-    }
-
     private void refreshButtons() {
-        if (mode == Mode.PLAN && shownMode != Mode.PLAN) { autoHidden = false; wardenHits = 0; }
+        if (mode == Mode.PLAN && shownMode != Mode.PLAN) { autoHidden = false; wardenHits = 0; wardenArmed = false; }
         if (mode == Mode.PLAN && shownMode != Mode.PLAN && scene.plan() != null && prefs.getBoolean("autoMini", true)) setCollapsed(true);
-        if (mode == Mode.PICK || mode == Mode.SURVEY) setCollapsed(false);
-        if (mode != Mode.PICK) { editing = false; hideEditList(); }
+        if ((mode == Mode.PICK || mode == Mode.SURVEY) && shownMode != mode) setCollapsed(false);
+        if (mode != Mode.PICK) { editing = false; pendingTarget = null; choosingArea = false; hideEditList(); }
         if (helpOpen && shownMode != mode) status.setText(help(mode));
         shownMode = mode;
         buttons.removeAllViews(); lagDot = null;
@@ -817,47 +938,127 @@ public final class OverlayService extends Service {
                 lagDot = new TextView(this); lagDot.setText("●"); lagDot.setTextColor(0xFF3DDC84); lagDot.setPadding(4, 0, 4, 0); b.add(lagDot);
                 break;
             case PICK:
-                b.add(button("Авто", 0xFF1565C0, v -> autoTarget()));
-                b.add(button(editing ? "Правка ●" : "Правка ○", editing ? 0xFFEF6C00 : 0xFF555555, v -> {
-                    editing = !editing; selected = null; selectedTile = null; hideEditList();
-                    setStatus(editing ? "Правка: тапни здание, чтобы сменить тип или удалить, или пустое место — добавить" : "Тапни по защите или замку — это цель");
-                    refreshButtons(); overlay.invalidate(); }));
-                b.add(namesButton());
-                b.add(button("Скан +", 0xFF2E7D32, v -> improve()));
-                b.add(button("Скан новый", 0xFF1B5E20, v -> scan()));
-                b.add(button("Отмена", 0xFF555555, v -> { setPick(false); mode = Mode.IDLE; scene = new Scene(); overlay.invalidate(); setStatus("Нажми «Скан»"); refreshButtons(); }));
+                b.add(button("Область", 0xFF1565C0, v -> nextAreaTarget()));
+                if (pendingTarget != null) b.add(button("Подтвердить", 0xFF2E7D32, v -> confirmTarget()));
+                else b.add(button("Авто", 0xFF1565C0, v -> autoTarget()));
+                if (editing) b.add(button("Готово", 0xFF2E7D32, v -> toggleEdit()));
                 break;
             case PLAN:
                 Scene sc = scene; int n = sc.res == null ? 0 : sc.res.options.size();
-                if (n > 1) {
-                    b.add(button("◀", 0xFF1565C0, v -> option(-1)));
-                    b.add(button("Вар " + (sc.opt + 1) + "/" + n, 0xFF1565C0, v -> option(1)));
-                    b.add(button("▶", 0xFF1565C0, v -> option(1)));
-                }
-                b.add(button("👁 Показ: " + VIEWS[view], 0xFF37474F, v -> cycleView()));
-                b.add(namesButton());
-                b.add(button("ИИ: " + AI[aiMode], aiMode == 0 ? 0xFF00838F : 0xFF555555, v -> { aiMode = (aiMode + 1) % 3; prefs.edit().putInt("ai", aiMode).apply(); refreshButtons(); }));
-                lagDot = new TextView(this); lagDot.setText("●"); lagDot.setTextColor(0xFF3DDC84); lagDot.setPadding(4, 0, 4, 0); b.add(lagDot);
-                b.add(button("Цель", 0xFF6A1B9A, v -> { trackGen++; mode = Mode.PICK; Scene c = scene; scene = c.with(c.B);
-                    setPick(true); setStatus("Тапни по новой цели"); refreshButtons(); overlay.invalidate(); }));
-                b.add(button("Скан +", 0xFF2E7D32, v -> improve()));
-                b.add(button("Скан новый", 0xFF1B5E20, v -> { trackGen++; scan(); }));
+                if (n > 1) b.add(button("Вариант " + (sc.opt + 1) + "/" + n, 0xFF1565C0, v -> option(1)));
+                b.add(button("Цель", 0xFF6A1B9A, v -> returnToPick()));
+                lagDot = new TextView(this);
+                lagDot.setText("●");
+                lagDot.setPadding(4, 0, 4, 0);
+                b.add(lagDot);
                 break;
         }
-        if (mode != Mode.BUSY) { b.add(button(helpOpen ? "? ●" : "?", 0xFF37474F, v -> toggleHelp())); b.add(button("Свернуть", 0xFF37474F, v -> setCollapsed(true))); }
-        b.add(closeButton());
+        if (mode != Mode.BUSY) b.add(button("⋯", 0xFF37474F, v -> showActions(v, false)));
         LinearLayout row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL);
         TextView drag = new TextView(this); drag.setText("⠿"); drag.setTextColor(0xFFAAB4C0); drag.setTextSize(18); drag.setPadding((int) (4 * dp()), 0, (int) (6 * dp()), 0);
         drag.setOnTouchListener(dragger(false)); row.addView(drag); buttons.addView(row);
-        int inRow = 0;
+        int maxWidth = Math.min(screenSize()[0] - (int) (16 * dp()), (int) (330 * dp()));
+        int spec = View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED);
+        drag.measure(spec, spec);
+        int used = drag.getMeasuredWidth();
         for (View v : b) {
-            if (inRow == 4) { row = new LinearLayout(this); row.setOrientation(LinearLayout.HORIZONTAL); row.setGravity(Gravity.CENTER_VERTICAL); buttons.addView(row); inRow = 0; }
-            row.addView(v); if (v != lagDot) inRow++;
+            v.measure(spec, spec);
+            int width = v.getMeasuredWidth();
+            if (v.getLayoutParams() instanceof LinearLayout.LayoutParams) {
+                LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) v.getLayoutParams();
+                width += lp.leftMargin + lp.rightMargin;
+            }
+            if (used + width > maxWidth) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+                buttons.addView(row);
+                used = 0;
+            }
+            row.addView(v);
+            used += width;
         }
+        setLag(trackingOk);
     }
 
-    private TextView namesButton() {
-        return button(names ? "Имена ●" : "Имена ○", names ? 0xFF37474F : 0xFF555555, v -> { names = !names; prefs.edit().putBoolean("names", names).apply(); refreshButtons(); overlay.invalidate(); });
+    private void toggleEdit() {
+        editing = !editing;
+        choosingArea = false;
+        pendingTarget = null;
+        selected = null;
+        selectedTile = null;
+        hideEditList();
+        setPick(editing);
+        setStatus(editing ? "Коснись здания для правки или пустого места, чтобы добавить здание." : PICK_HINT);
+        refreshButtons();
+        overlay.invalidate();
+    }
+
+    private void returnToPick() {
+        Scene current = scene;
+        scene = current.with(current.B);
+        mode = Mode.PICK;
+        pendingTarget = null;
+        choosingArea = false;
+        setPick(false);
+        startTracking();
+        setStatus(PICK_HINT);
+        refreshButtons();
+        overlay.invalidate();
+    }
+
+    private void showActions(View anchor, boolean miniMenu) {
+        android.widget.PopupMenu menu = new android.widget.PopupMenu(this, anchor);
+        menuAction(menu, "Подписи зданий " + (names ? "✓" : "○"), () -> {
+            names = !names;
+            prefs.edit().putBoolean("names", names).apply();
+            overlay.invalidate();
+        });
+        boolean cleanup = prefs.getBoolean("cleanup", false);
+        menuAction(menu, "Подчистка супершарами " + (cleanup ? "✓" : "○"), () -> {
+            prefs.edit().putBoolean("cleanup", !cleanup).apply();
+            if (mode == Mode.PLAN) recalculate();
+        });
+        if (!miniMenu) {
+            if (mode == Mode.PICK) menuAction(menu, editing ? "Закончить правку" : "Правка", this::toggleEdit);
+            if (mode == Mode.PLAN) {
+                menuAction(menu, "Показ: " + VIEWS[view], this::cycleView);
+                menuAction(menu, "ИИ: " + AI[aiMode], () -> {
+                    aiMode = (aiMode + 1) % 3;
+                    prefs.edit().putInt("ai", aiMode).apply();
+                });
+            }
+            if (mode == Mode.PLAN || mode == Mode.PICK) {
+                menuAction(menu, "Скан +", this::improve);
+                menuAction(menu, "Скан новый", this::scan);
+            }
+            menuAction(menu, "Справка", this::toggleHelp);
+            menuAction(menu, "Свернуть", () -> setCollapsed(true));
+            menuAction(menu, "Закрыть…", () -> {
+                if (android.os.SystemClock.uptimeMillis() - closeArmed < 3000 && closeArmed != 0) stopSelf();
+                else {
+                    closeArmed = android.os.SystemClock.uptimeMillis();
+                    android.widget.Toast.makeText(this, "Нажми «Закрыть» ещё раз", android.widget.Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
+        menu.show();
+    }
+
+    private static void menuAction(android.widget.PopupMenu menu, String title, Runnable action) {
+        menu.getMenu().add(title).setOnMenuItemClickListener(item -> { action.run(); return true; });
+    }
+
+    private void recalculate() {
+        Scene sc = scene;
+        mode = Mode.BUSY;
+        setStatus("Пересчитываю план…");
+        refreshButtons();
+
+        work.post(() -> {
+            Solver.Result result = solver(sc.B, sc.target).solve();
+            ui.post(() -> showPlan(sc, sc.target, result, sc.via));
+        });
     }
 
     private void option(int d) {

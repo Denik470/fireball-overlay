@@ -39,16 +39,34 @@ final class OverlayView extends View {
         return new double[]{(u + s) / 2 + sc.ox, (s - u) / 2 + sc.oy};
     }
 
+    private float downX, downY;
+    private boolean tap;
+
     @Override public boolean onTouchEvent(MotionEvent e) {
-        if (e.getAction() == MotionEvent.ACTION_UP) svc.pickAt(e.getX(), e.getY());
+        switch (e.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                downX = e.getX(); downY = e.getY(); tap = true;
+                break;
+            case MotionEvent.ACTION_MOVE:
+            case MotionEvent.ACTION_UP:
+                int slop = android.view.ViewConfiguration.get(getContext()).getScaledTouchSlop();
+                if (Math.hypot(e.getX() - downX, e.getY() - downY) > slop) tap = false;
+                if (tap && e.getActionMasked() == MotionEvent.ACTION_UP) svc.pickAt(e.getX(), e.getY());
+                break;
+            case MotionEvent.ACTION_POINTER_DOWN:
+            case MotionEvent.ACTION_CANCEL:
+                tap = false;
+                break;
+        }
         return true;
     }
 
     // ---- grid-space geometry, rebuilt only when the scene or the chosen option changes ----
     private static final class Geo {
         OverlayService.Scene sc; Solver.Plan o; boolean pick;
-        final Path[] area = {new Path(), new Path(), new Path(), new Path()};
-        final List<Path> bind = new ArrayList<>(); final Path cleanX = new Path(), fb = new Path(), splash = new Path();
+        final Path area = new Path();
+        final java.util.Map<Integer, Path> damage = new java.util.LinkedHashMap<>();
+        final List<Path> bind = new ArrayList<>(); final Path cleanX = new Path(), fb = new Path();
         final List<Path> zEdge = new ArrayList<>(), zCircle = new ArrayList<>(), zGroup = new ArrayList<>(); final List<Integer> zColor = new ArrayList<>();
         Path eqEdge, eqCircle; final Path ok = new Path(), weak = new Path(), target = new Path(), castle = new Path(), via = new Path(), manual = new Path();
     }
@@ -73,8 +91,10 @@ final class OverlayView extends View {
         Geo g = new Geo(); g.sc = sc; g.o = o; g.pick = pick; Solver.Bld T = sc.target;
         if (o != null) {
             double tcx = T.cx(), tcy = T.cy();
-            double maxM = Math.max(0.3, Math.min(o.wardenTol, 3)), h = Solver.STEP / 2;
-            for (int i = 0; i < o.area.length; i += 3) { int k = (int) Math.min(3, Math.floor(4 * Math.min(o.area[i + 2], maxM) / maxM)); quad(g.area[k], o.area[i] - h, o.area[i + 1] - h, o.area[i] + h, o.area[i + 1] + h); }
+            double h = Solver.STEP / 2;
+            for (int i = 0; i < o.area.length; i += 3) {
+                quad(g.area, o.area[i] - h, o.area[i + 1] - h, o.area[i] + h, o.area[i + 1] + h);
+            }
             double[] wp = o.wardenPt;
             for (Solver.Bld d : o.binding) {
                 double dcx = d.cx(), dcy = d.cy(), mx = (dcx + tcx) / 2, my = (dcy + tcy) / 2, vx = -(dcy - tcy), vy = dcx - tcx, n = Math.hypot(vx, vy), ux = vx / n, uy = vy / n;
@@ -86,7 +106,13 @@ final class OverlayView extends View {
                 g.cleanX.moveTo((float) b.x, (float) (b.y + b.w)); g.cleanX.lineTo((float) (b.x + b.w), (float) b.y);
             }
             g.fb.set(circle(tcx, tcy, svc.getSharedPreferences("fb", 0).getFloat("fbR", 6)));
-            for (Solver.Bld b : o.splash) if (b != T) foot(g.splash, b);
+            android.content.SharedPreferences prefs = svc.getSharedPreferences("fb", 0);
+            int ballLevel = MainActivity.fireballLevel(prefs);
+            int quakeLevel = MainActivity.quakeLevel(prefs);
+            for (Solver.Bld b : o.splash) {
+                int color = DamageEstimate.platformColor(b, sc.B, o, MainActivity.FB_DAMAGE[ballLevel - 1], quakeLevel);
+                foot(g.damage.computeIfAbsent(color, key -> new Path()), b);
+            }
             for (Solver.Zone z : o.zones) {
                 g.zEdge.add(cells(z.edge, 0.14)); g.zColor.add(marginColor(z.margin)); g.zCircle.add(circle(z.centre[0], z.centre[1], Solver.INVIS_R));
                 Path gp = new Path(); for (Solver.Bld b : z.group) foot(gp, b); g.zGroup.add(gp);
@@ -122,7 +148,12 @@ final class OverlayView extends View {
 
     @Override protected void onDraw(Canvas c) {
         x = svc.xf; sc = svc.scene; OverlayService.Mode mode = svc.mode;
-        if (x == null || sc == null || sc.B.isEmpty() || mode == OverlayService.Mode.IDLE) return;
+        if (x == null || sc == null || sc.B.isEmpty() || mode == OverlayService.Mode.IDLE || mode == OverlayService.Mode.BUSY) return;
+        if (svc.showArea()) {
+            line.setColor(0xE6FFFFFF); line.setStrokeWidth(2 * dp);
+            c.drawCircle(getWidth() / 2f, getHeight() / 2f, 14 * dp, line);
+        }
+        if (!svc.trackingOk) return;
         getLocationOnScreen(loc);
         // grid (X, Y) -> view: vx = a(X - Y) + tx, vy = b(X + Y) + ty
         double tx = x.cx - loc[0] + x.a * (-sc.ox + sc.oy - x.du), ty = x.cy - loc[1] + x.b * (-sc.ox - sc.oy - x.ds);
@@ -135,13 +166,13 @@ final class OverlayView extends View {
         Geo g = geo; if (g == null || g.sc != sc || g.o != o || g.pick != pick) geo = g = build(sc, o, pick);
         if (o != null) {
             if (full) {
-                for (int k = 0; k < 4; k++) paint(c, g.area[k], ((int) (255 * (0.25 + 0.18 * k)) << 24) | 0x28BEFF);
+                paint(c, g.area, 0x7028BEFF);
                 for (Path p : g.bind) stroke(c, p, 0xFF78D7FF, 2, dash8);
             }
             double[] wp = o.wardenPt;
-            aim(c, wp[0], wp[1], 0xFF8FE3FF); label(c, wp[0] + 1.1, wp[1] + 1.1, "ДЕД ±" + String.format("%.1f", o.wardenTol), 0xFF8FE3FF);
+            aim(c, wp[0], wp[1], 0xFF8FE3FF); label(c, wp[0] + 1.1, wp[1] + 1.1, "±" + String.format("%.1f", o.wardenTol), 0xFF8FE3FF);
             stroke(c, g.cleanX, 0xFFFF1744, 4, null);
-            if (full) { paint(c, g.fb, 0x1AFF8C00); paint(c, g.splash, 0x40FF8C00); }
+            if (full) { paint(c, g.fb, 0x1AFF8C00); }
             stroke(c, g.fb, 0xF2FF8C00, full ? 2 : 1.2f, null);
             for (int i = 0; i < o.zones.size(); i++) {
                 Solver.Zone z = o.zones.get(i);
@@ -162,9 +193,12 @@ final class OverlayView extends View {
             paint(c, g.castle, pick ? 0x504FC3F7 : 0x204FC3F7); stroke(c, g.castle, 0xFF4FC3F7, pick ? 2 : 1.2f, null);
             if (pick) { paint(c, g.manual, 0x30FFFFFF); stroke(c, g.manual, 0xAAFFFFFF, 1, dash6); }
         }
+        if (o != null && full) for (java.util.Map.Entry<Integer, Path> entry : g.damage.entrySet()) {
+            paint(c, entry.getValue(), entry.getKey());
+        }
         if (sc.via != null) { paint(c, g.via, 0x504FC3F7); stroke(c, g.via, 0xFF4FC3F7, 3, null); }
         boolean names = svc.names;
-        if (pick && names) for (Solver.Bld b : sc.B) if (b.def || b.castle()) {
+        if (full && names) for (Solver.Bld b : sc.B) if (b.def || b.castle()) {
             boolean w = b.weak(); label(c, b.cx(), b.cy(), Solver.ru(b.name) + (w ? " ?" : ""), b.castle() ? 0xFF8FD8FF : w ? 0xFFFFD54A : 0xFFFFFFFF);
         }
         if (pick && svc.editing) {
@@ -172,7 +206,13 @@ final class OverlayView extends View {
             if (sel != null) { tmp2.reset(); foot(tmp2, sel); paint(c, tmp2, 0x6600E5FF); stroke(c, tmp2, 0xFF00E5FF, 3, null); }
             else if (t != null) { tmp2.reset(); quad(tmp2, t[0], t[1], t[0] + 1, t[1] + 1); paint(c, tmp2, 0x6600E5FF); stroke(c, tmp2, 0xFF00E5FF, 3, null); }
         }
-        if (T != null) { paint(c, g.target, 0x59FF2828); stroke(c, g.target, 0xFFFF3B3B, 3, null); if (names) label(c, T.cx(), T.cy(), Solver.ru(T.name), 0xFFFF6B6B); }
+        if (pick && svc.pendingTarget != null) {
+            tmp2.reset();
+            foot(tmp2, svc.pendingTarget);
+            paint(c, tmp2, 0x503DDC84);
+            stroke(c, tmp2, 0xFF3DDC84, 3, null);
+        }
+        if (T != null) { stroke(c, g.target, 0xFFFFE082, 3, null); if (names) label(c, T.cx(), T.cy(), Solver.ru(T.name), 0xFFFF6B6B); }
         if (sc.via != null && names) label(c, sc.via.cx(), sc.via.cy(), Solver.ru(sc.via.name), 0xFF8FD8FF);
     }
 }

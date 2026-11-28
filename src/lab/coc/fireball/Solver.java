@@ -30,14 +30,14 @@ final class Solver {
     static final Map<String, String> RU = new HashMap<>();
     static {
         String[] p = {"Air Defense", "ПВО", "Air Sweeper", "Воздушка", "Archer Tower", "Лучницы", "Bomb Tower", "Бомб. башня", "Cannon", "Пушка",
-                "Crafting Station", "Мастерская", "Eagle Artillery", "Орёл", "Firespitter", "Огнемёт", "Inferno Tower", "Инферно", "Monolith", "Монолит",
-                "Mortar", "Мортира", "Multi Archer Tower", "Мульти-лучн.", "Multi Gear Tower", "Мульти-шест.", "Revenge Tower", "Башня мести",
+                "Crafting Station", "Мастерская", "Eagle Artillery", "Орёл", "Firespitter", "Огнеметатель", "Inferno Tower", "Инферно", "Monolith", "Монолит",
+                "Mortar", "Мортира", "Multi Archer Tower", "Мульти-лучн.", "Multi Gear Tower", "Мультибашня", "Revenge Tower", "Башня мести",
                 "Ricochet Cannon", "Рикошет", "Scattershot", "Швырятель", "Spell Tower", "Башня закл.", "Super Wizard Tower", "Супермаг",
                 "Wizard Tower", "Маг. башня", "Builders Hut", "Домик строителя", "X-Bow", "Арбалет", "Town Hall", "Ратуша", "Clan Castle", "Замок клана"};
         for (int i = 0; i < p.length; i += 2) RU.put(p[i], p[i + 1]);
     }
     static String ru(String n) { String r = RU.get(n); return r == null ? n : r; }
-    static final String CASTLE = "Clan Castle";
+    static final String CASTLE = "Clan Castle", HUT = "Builders Hut";
 
     /** Types offered when the user fixes a building by hand: Clan Castle first, then the defences by Russian name. */
     static List<String> editTypes() {
@@ -45,15 +45,20 @@ final class Solver {
     }
 
     static final class Bld {
-        final String name; final int w; double x, y; final double conf; final boolean def;
+        final String name; final int w; double x, y; final double conf; boolean def;
         final int u, s;  // footprint centre in the lattice frame of the scan (for tracking)
         /** Set by the user (type chosen by hand): the survey never relabels it and it is not used to align frames. */
         boolean manual;
+        int level; // 0 = model does not know the level
         /** Survey votes: type -> summed confidence over sightings, and the number of sightings. */
         Map<String, Double> votes = new java.util.concurrent.ConcurrentHashMap<>(); int seen;
         Bld(String name, int w, double x, double y, double conf, int u, int s) {
             this.name = name; this.w = w; this.x = x; this.y = y; this.conf = conf; this.def = DEFENSES.contains(name); this.u = u; this.s = s;
             votes.put(name, conf); seen = 1;
+        }
+        void setLevel(int value) {
+            level = value;
+            def = DEFENSES.contains(name) && !(HUT.equals(name) && value == 1);
         }
         double cx() { return x + w / 2.0; }
         double cy() { return y + w / 2.0; }
@@ -67,7 +72,7 @@ final class Solver {
         }
         /** Copy moved by (dx, dy) or renamed; keeps votes and the manual mark. */
         Bld copy(String newName, double dx, double dy) {
-            Bld b = new Bld(newName, w, x + dx, y + dy, conf, u, s); b.manual = manual; b.votes = new java.util.concurrent.ConcurrentHashMap<>(votes); b.seen = seen; return b;
+            Bld b = new Bld(newName, w, x + dx, y + dy, conf, u, s); b.manual = manual; if (name.equals(newName)) b.setLevel(level); b.votes = new java.util.concurrent.ConcurrentHashMap<>(votes); b.seen = seen; return b;
         }
     }
 
@@ -311,7 +316,8 @@ final class Solver {
         for (int k = 0; k < nP; k++) {
             float v = pd[k]; Bld arg = null;
             for (Bld d : vis) { float a = M.get(d)[k]; if (a < v) { v = a; arg = d; } }
-            if (v >= 0) { area.add(px[k], py[k], v); if (arg != null && v < 0.6) bind.merge(arg, 1, Integer::sum); }
+            if (v >= wardenMin) area.add(px[k], py[k], v);
+            if (v >= 0 && arg != null && v < 0.6) bind.merge(arg, 1, Integer::sum);
         }
         o.area = area.toArray(); o.binding.addAll(bind.keySet());
         o.wardenPt = new double[]{px[o.wardenK], py[o.wardenK]};

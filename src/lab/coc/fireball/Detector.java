@@ -14,6 +14,8 @@ import java.io.InputStream;
 import java.nio.FloatBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.Set;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -111,7 +113,10 @@ final class Detector {
         }
         if (used != null) used[0] = k;
         int H = img.getHeight(); List<Det> kept = new ArrayList<>();
-        for (Det x : d) if (0.07 * H < x.py && x.py < 0.81 * H) kept.add(x);  // top banner and the troop card bar
+        for (Det x : d) {
+            if (!x.name.equals("Giga Bomb") && !x.name.equals("Guardian Platform")
+                    && 0.07 * H < x.py && x.py < 0.81 * H) kept.add(x);
+        }
         return kept;
     }
 
@@ -122,14 +127,22 @@ final class Detector {
     }
 
     Lattice fit(List<Det> dets) {
+        List<Det> anchors = new ArrayList<>();
+        for (Det d : dets) if (d.w >= 2 && !d.name.startsWith("Hero ")) anchors.add(d);
+        if (anchors.size() < 4) {
+            anchors.clear();
+            for (Det d : dets) if (!d.name.startsWith("Hero ")) anchors.add(d);
+        }
+        if (anchors.isEmpty()) return null;
         List<Double> w = new ArrayList<>();
-        for (Det d : dets) if (d.w >= 2) w.add(d.bw / (2 * d.w));
-        if (w.isEmpty()) for (Det d : dets) w.add(d.bw / 2);
+        for (Det d : anchors) w.add(d.bw / (2 * d.w));
+        Set<Det> anchored = new HashSet<>(anchors);
+        int sampleCount = anchors.size();
         double est = median(w); int n = dets.size(); Lattice best = null;
         for (int i = 0; i <= 120; i++) {
             double a = est * (0.85 + 0.3 * i / 120), b = a * ratio;
             double sxr = 0, sxi = 0, syr = 0, syi = 0;
-            for (Det d : dets) {
+            for (Det d : anchors) {
                 sxr += Math.cos(2 * Math.PI * d.px / a); sxi += Math.sin(2 * Math.PI * d.px / a);
                 syr += Math.cos(2 * Math.PI * d.py / b); syi += Math.sin(2 * Math.PI * d.py / b);
             }
@@ -138,11 +151,12 @@ final class Detector {
             for (int j = 0; j < n; j++) {
                 Det d = dets.get(j); double fu = (d.px - cx) / a, fs = (d.py - cy) / b;
                 u[j] = (int) Math.rint(fu); s[j] = (int) Math.rint(fs);
+                if (!anchored.contains(d)) continue;
                 res += Math.hypot(fu - u[j], fs - s[j]);
                 if (Math.floorMod(u[j] + s[j], 2) != d.w % 2) bad++;
             }
-            if (bad * 2 > n) { for (int j = 0; j < n; j++) u[j] += 1; cx -= a; bad = n - bad; }  // parity-consistent origin
-            double score = res / n + 0.5 * bad / n;
+            if (bad * 2 > sampleCount) { for (int j = 0; j < n; j++) u[j] += 1; cx -= a; bad = sampleCount - bad; }  // parity-consistent origin
+            double score = res / sampleCount + 0.5 * bad / sampleCount;
             if (best == null || score < best.score) { best = new Lattice(); best.a = a; best.b = b; best.cx = cx; best.cy = cy; best.u = u; best.s = s; best.score = score; }
         }
         return best;
